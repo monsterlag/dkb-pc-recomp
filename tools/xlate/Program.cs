@@ -30,7 +30,27 @@ static class SwshXlate
     {
         readonly byte[] _code; readonly JsonObject _job; int _binding = 1; public readonly List<string> Notes = new(); public readonly SortedSet<int> TexQueried = new(), ImgQueried = new();
         readonly byte[] _c1;
-        public Accessor(byte[] code, JsonObject job) { _code = code; _job = job; _c1 = job["c1"] is JsonNode h ? Convert.FromHexString((string)h) : Array.Empty<byte>(); }
+        readonly int _rootBytes;
+        public Accessor(byte[] code, JsonObject job)
+        {
+            _code = code; _job = job; _c1 = job["c1"] is JsonNode h ? Convert.FromHexString((string)h) : Array.Empty<byte>();
+            if (job["c0"] != null)
+            {
+                if (job["c0_version"]?.GetValue<int>() != 2 || job["c0"] is not JsonArray counts || counts.Count != 4 ||
+                    job["c0_roots"] is not JsonArray roots || roots.Count != 8)
+                    throw new InvalidDataException("NVN 2 compute requires root layout version 2; regenerate shader inputs");
+                foreach (JsonNode root in roots)
+                {
+                    int words = root.GetValue<int>();
+                    if (words < 0 || words > 64) throw new InvalidDataException("NVN 2 root table exceeds 64 words");
+                    _rootBytes += ((words + 3) & ~3) * 4;
+                }
+                if ((int)counts[0] < 0 || (int)counts[0] > 32 || (int)counts[1] < 0 || (int)counts[1] > 16 ||
+                    (int)counts[2] < 0 || (int)counts[2] > 16 || (int)counts[3] < 0 || (int)counts[3] > 128 ||
+                    16 + _rootBytes + 16 * ((int)counts[1] + (int)counts[2]) + 8 * ((int)counts[0] + (int)counts[3]) > 0x800)
+                    throw new InvalidDataException("NVN 2 compute parameter block exceeds the host layout");
+            }
+        }
         // c1 常数段（着色器包控制段前 0x100 字节）：间接跳转 BRX 的跳转表在这里（LDC c[1]）；不提供时翻译器解不出跳转目标、控制流出错（粒子着色器死循环）
         // c1 constant segment (the 0x100 bytes before the control segment in the shader package): the jump table of indirect jump BRX lives here (LDC c[1]); without it the translator cannot resolve jump targets and control flow goes wrong (particle shaders loop forever)
         public uint ConstantBuffer1Read(int offset) { if (offset >= 0 && offset + 4 <= _c1.Length) return BitConverter.ToUInt32(_c1, offset); Notes.Add($"c1 读越界 +{offset:X}（c1 长 {_c1.Length}）"); return 0; }
@@ -51,11 +71,11 @@ static class SwshXlate
             (int off0, _, _) = TextureHandle.UnpackOffsets(handle);
             int bytes = off0 * 4;
             // "c0": [images, uniform buffers, storage buffers, textures] of an NVN 2 compute bank (the host's gfx_shader.c,
-            // NVN2_C0_LAYOUT): texture handles after 0x10 + 16 bytes per image, uniform and storage buffer, then the
-            // image handles, 8 bytes each. Textures answer with their slot, images with theirs.
+            // NVN2_C0_LAYOUT): a 16-byte head, separately padded root tables, uniform/storage tables, texture and
+            // image handles. Root counts are independent of the number of images. Texture/image handles are 8 bytes.
             if (_job["c0"] is JsonArray c && c.Count == 4)
             {
-                int tex = 0x10 + 16 * ((int)c[0] + (int)c[1] + (int)c[2]), img = tex + 8 * (int)c[3];
+                int tex = 0x10 + _rootBytes + 16 * ((int)c[1] + (int)c[2]), img = tex + 8 * (int)c[3];
                 if (bytes >= tex && bytes < img && (bytes - tex) % 8 == 0) return (bytes - tex) / 8;
                 if (bytes >= img && bytes < img + 8 * (int)c[0] && (bytes - img) % 8 == 0) return (bytes - img) / 8;
                 return -1;
@@ -156,15 +176,45 @@ static class SwshXlate
                 foreach (var b in p.Info.SBuffers) res["sbufs"].AsArray().Add((JsonNode)new JsonObject { ["binding"] = b.Binding, ["slot"] = b.Slot, ["cb_slot"] = b.SbCbSlot, ["cb_offset"] = b.SbCbOffset, ["flags"] = (int)b.Flags });
                 foreach (var (list, name) in new[] { (p.Info.Textures, "textures"), (p.Info.Images, "images") })
                     foreach (var t in list) res[name].AsArray().Add((JsonNode)new JsonObject { ["binding"] = t.Binding, ["type"] = (int)t.Type, ["format"] = t.Format.ToString(), ["cbuf_slot"] = t.CbufSlot, ["handle"] = t.HandleIndex, ["array"] = t.ArrayLength, ["separate"] = t.Separate, ["flags"] = (int)t.Flags });
-                if (job["c0"] is JsonNode c0) res["c0"] = c0.DeepClone();   // NVN 2 compute bank counts, for the host
+                if (job["c0"] is JsonNode c0) {
+                    res["c0"] = c0.DeepClone();
+                    res["c0_version"] = 2;
+                    res["c0_roots"] = job["c0_roots"].DeepClone();
+                }
                 File.WriteAllText(Path.Combine(outDir, key + ".res.json"), res.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
                 return null;
             }
             catch (Exception e) { if (Environment.GetEnvironmentVariable("DMSH_STACK") != null) Console.Error.WriteLine(e.StackTrace); return $"{e.GetType().Name}: {e.Message.Split('\n')[0]}"; }
     }
 
+    // Exercises the actual resource-query path with roots whose sizes cannot be inferred from imageCount.
+    static int ProbeNvn2C0()
+    {
+        JsonObject job = JsonNode.Parse("""
+            {"c0_version":2,"c0":[7,1,2,3],"c0_roots":[3,0,5,0,0,0,0,0],
+             "tex":{"0":"3d","1":"cube"},"img":{"0":{"type":"2d","fmt":"R32Uint"}}}
+            """).AsObject();
+        var a = new Accessor(Array.Empty<byte>(), job);
+        int checks = 0;
+        void Check(bool value) { checks++; if (!value) throw new InvalidDataException("NVN 2 layout probe failed at check " + checks); }
+        Check(a.QuerySamplerType(0x70 / 4, 0) == SamplerType.Texture3D);
+        Check(a.QuerySamplerType(0x78 / 4, 0) == SamplerType.TextureCube);
+        Check(a.QueryTextureFormat(0x88 / 4, 0) == TextureFormat.R32Uint);
+        job["c0"][0] = 1;
+        Check(new Accessor(Array.Empty<byte>(), job).QuerySamplerType(0x70 / 4, 0) == SamplerType.Texture3D);
+        job["c0_roots"] = new JsonArray(0, 0, 0, 0, 0, 0, 0, 0);
+        Check(new Accessor(Array.Empty<byte>(), job).QuerySamplerType(0x40 / 4, 0) == SamplerType.Texture3D);
+        job.Remove("c0_version");
+        bool rejected = false;
+        try { _ = new Accessor(Array.Empty<byte>(), job); } catch (InvalidDataException) { rejected = true; }
+        Check(rejected);
+        Console.WriteLine($"probe-nvn2-c0: passed ({checks} checks)");
+        return 0;
+    }
+
     static int Main(string[] args)
     {
+        if (args.Length == 1 && args[0] == "--probe-nvn2-c0") return ProbeNvn2C0();
         if (args.Length == 1 && args[0] == "--serve")
         {
             // One request per line: {"job": {...}, "out": "<dir>"}; one reply line "ok <key>" / "fail <key> <message>".

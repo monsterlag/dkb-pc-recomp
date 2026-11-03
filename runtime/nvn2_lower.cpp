@@ -15,7 +15,7 @@ extern "C" uint64_t gfx_shader_nvn2_hash(const uint8_t *control, const uint8_t *
 
 namespace {
 constexpr size_t kControl = 0x880;   // gfx_shader.c CONTROL_SIZE
-constexpr size_t kC0Layout = 0x860;  // "DKC0" + compute bank counts (gfx_shader.c NVN2_C0_LAYOUT)
+constexpr size_t kC0Layout = 0x860;  // "DKC1" + compute parameter layout (gfx_shader.c NVN2_C0_LAYOUT)
 constexpr uint64_t kMaxwellNop = 0x50b0000000070f00ull;
 constexpr uint64_t kMaxwellExit = 0xe30000000007000full;
 
@@ -117,11 +117,14 @@ Lowered *lower(const uint8_t *control, const uint8_t *code) {
         std::memcpy(out->control.data() + 0x748, control + 0x58, 12);   // local size (NVN 2 control +0x58)
         // The compute driver bank is packed per program from these counts (gfx_shader.c, "NVN 2 compute c0"):
         // images +0xb6, uniform buffers +0xb1, storage buffers +0xb2, textures +0xb3.
-        const uint8_t lay[8] = {'D', 'K', 'C', '0', control[0xb6], control[0xb1], control[0xb2], control[0xb3]};
+        // DKC1 adds the eight root-table word counts. The marker and counts enter the code/cache hash, so an older
+        // DKC0 translation cannot be reused with the new parameter-block layout.
+        const uint8_t lay[8] = {'D', 'K', 'C', '1', control[0xb6], control[0xb1], control[0xb2], control[0xb3]};
         std::memcpy(out->control.data() + kC0Layout, lay, sizeof lay);
         // Shared memory bytes (NVN 2 control +0x64; Bananza's upscaling network uses 0x2a88): the translator sizes the
         // workgroup's shared array from it, and with 0 every LDS read back nothing.
         std::memcpy(out->control.data() + kC0Layout + 8, control + 0x64, 4);
+        std::memcpy(out->control.data() + kC0Layout + 12, control + 0xa9, 8);
     }
     return out;
 }

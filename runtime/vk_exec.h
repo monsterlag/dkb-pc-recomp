@@ -81,8 +81,8 @@ typedef struct VkExec {
     NVNbufferRange vbuf[16];             // OP_BIND_VBUF
     p_bind_buf ubo[6][18], ssbo[6][16];  // OP_BIND_UBO / OP_BIND_SSBO per stage and index
     uint64_t tex[6][128], samp[6][128], img[6][32];   // OP_BIND_TEX / OP_BIND_SAMP / OP_BIND_IMG handles per stage
-    uint32_t push[2][64];                // OP_PUSH_CONST root table 0, graphics and compute: constant bank 24
-    uint64_t push_set[2];                // bit i: word i of push[k] was written (other words keep the guessed blit block)
+    uint32_t push[2][NVN2_ROOT_TABLES][NVN2_ROOT_WORDS];   // graphics root 0 (bank 24), compute roots in packed c0
+    uint64_t push_set[2][NVN2_ROOT_TABLES];                // words written; used by the graphics blit fallback
 
     // ---- vk_exec_xfer.c slots (render enable, conditional rendering): left empty by vk_exec.c
     int render_disabled;                 // OP_RENDER_ENABLE false or a failed OP_RENDER_COND: clears and draws skip
@@ -162,7 +162,7 @@ void vk_dump_present(uint64_t frame);    // vk_be_present: waits for the dump fr
 
 // c0, the NVN driver constant bank of one stage (vk_exec_draw.c; TOTK_FIX_C0=0 binds zeros instead): bank is
 // VK_C0_BYTES, stage an NVN stage (0 vertex, 1 fragment, 5 compute), ssbo and ubo the 16 bound slots of that stage.
-#define VK_C0_BYTES 0x800u
+#define VK_C0_BYTES NVN2_C0_BYTES
 void vk_c0_fill(uint8_t bank[VK_C0_BYTES], int stage, const p_bind_buf ssbo[16], const p_bind_buf ubo[16],
                 const uint32_t dispatch[3], uint32_t base_instance);
 

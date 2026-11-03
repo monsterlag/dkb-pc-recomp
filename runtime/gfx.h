@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include "host.h"
 #include "nvn_obj.h"
+#include "nvn2_c0.h"
 
 // ---- moved from ov.h
 enum { OE_MSG_FOCUS_STATE_CHANGED = 15, OE_MSG_OPERATION_MODE_CHANGED = 30, OE_MSG_PERFORMANCE_MODE_CHANGED = 31 };
@@ -98,8 +99,8 @@ typedef struct {
 typedef struct { uint8_t type, comps, packed; } GfxShaderIo;   // GFX_TYPE_*, components, 1 with a Component decoration
 int gfx_shader_stage(const GfxShader *s);                   // GFX_STAGE_VS, GFX_STAGE_FS or GFX_STAGE_CS
 int gfx_shader_resources(const GfxShader *s, int kind, const GfxShaderRes **res);   // count of GFX_RES_* kind; array in *res
-// NVN 2 compute bank counts {images, uniform buffers, storage buffers, textures} (gfx_shader.c NVN2_C0_LAYOUT), or NULL
-const uint8_t *gfx_shader_c0_layout(const GfxShader *s);
+// NVN 2 compute parameter-block layout, including the declared root-table word counts, or NULL.
+const Nvn2C0Layout *gfx_shader_c0_layout(const GfxShader *s);
 uint32_t gfx_shader_slot_mask(const GfxShader *s);                    // texture/image slots whose type its translation read
 uint32_t gfx_shader_inputs(const GfxShader *s, GfxShaderIo io[32]);    // Input Locations (VS attributes, FS varyings) as a mask
 uint32_t gfx_shader_outputs(const GfxShader *s, GfxShaderIo io[32]);   // Output Locations (VS varyings, FS colour targets)
