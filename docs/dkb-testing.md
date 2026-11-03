@@ -18,6 +18,11 @@ executable, not the generated code, not the shader cache.
 Install the toolchain from [building.md](building.md) (MSYS2 UCRT64 Clang, Ninja, Python 3.12 in `.venv`, .NET SDK),
 then run the commands in the README, "Building from source". The executable ends up in `build\dkb100\dkb.exe`.
 
+The generation command must include `--patches recomp\patches-dkb100.txt`. This enables the controller setup patch
+that bypasses the game's HID server proxy, which the host does not implement. If you generated the code without
+that argument, rerun the README's generation command with it and then rebuild with `tools\build_game.py`.
+Rebuilding alone leaves the unpatched generated code in place and the game stops during controller setup.
+
 ## Run
 
 ```
