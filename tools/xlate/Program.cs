@@ -31,9 +31,18 @@ static class SwshXlate
         readonly byte[] _code; readonly JsonObject _job; int _binding = 1; public readonly List<string> Notes = new(); public readonly SortedSet<int> TexQueried = new(), ImgQueried = new();
         readonly byte[] _c1;
         readonly int _rootBytes;
+        public int StorageCandidatesVersion { get; }
         public Accessor(byte[] code, JsonObject job)
         {
             _code = code; _job = job; _c1 = job["c1"] is JsonNode h ? Convert.FromHexString((string)h) : Array.Empty<byte>();
+            if (job.TryGetPropertyValue("storage_candidates_version", out JsonNode version))
+            {
+                if (version is not JsonValue value || !value.TryGetValue<int>(out int parsed) || parsed is not (0 or 1))
+                    throw new InvalidDataException("unsupported storage_candidates_version; expected integer 0 or 1");
+                StorageCandidatesVersion = parsed;
+            }
+            if (StorageCandidatesVersion == 1 && ((string)job["stage"] != "cs" || job["c0"] is not JsonArray))
+                throw new InvalidDataException("storage candidates v1 requires NVN 2 compute root layout version 2");
             if (job["c0"] != null)
             {
                 if (job["c0_version"]?.GetValue<int>() != 2 || job["c0"] is not JsonArray counts || counts.Count != 4 ||
@@ -144,6 +153,8 @@ static class SwshXlate
         // "sbuf_align": n: the host binds each storage buffer at its guest address rounded down to n (minStorageBufferOffsetAlignment
         // above 4), so storage offsets count from there (Ryujinx's unaligned path; the multi-target path uses n too).
         public bool QueryHasUnalignedStorageBuffer() => _job["sbuf_align"] is JsonNode;
+        public bool QueryStorageBufferRuntimeCandidates() => StorageCandidatesVersion == 1;
+        public bool QueryHostSupportsStorageBufferArrayLength() => true;
         public int QueryHostStorageBufferOffsetAlignment() => _job["sbuf_align"] is JsonNode n ? (int)n : 16;
         // "subgroup": n: lanes per subgroup when the host cannot pin 32 (AMD GCN/Vega run 64): ballots and votes span n lanes.
         public int QueryHostSubgroupSize() => _job["subgroup"] is JsonNode n ? (int)n : 32;
@@ -170,6 +181,7 @@ static class SwshXlate
                     ["key"] = key, ["stage"] = (string)job["stage"], ["notes"] = new JsonArray(acc.Notes.ConvertAll(n => (JsonNode)n).ToArray()),
                     ["cbufs"] = new JsonArray(), ["sbufs"] = new JsonArray(), ["textures"] = new JsonArray(), ["images"] = new JsonArray(),
                     ["uses_frag_coord"] = p.Info.UsesFragCoord, ["frag_out_map"] = p.Info.FragmentOutputMap,
+                    ["storage_candidates_version"] = acc.StorageCandidatesVersion,
                     ["tex_queried"] = new JsonArray(acc.TexQueried.Select(x => (JsonNode)x).ToArray()), ["img_queried"] = new JsonArray(acc.ImgQueried.Select(x => (JsonNode)x).ToArray()),
                 };
                 foreach (var b in p.Info.CBuffers) res["cbufs"].AsArray().Add((JsonNode)new JsonObject { ["binding"] = b.Binding, ["slot"] = b.Slot });

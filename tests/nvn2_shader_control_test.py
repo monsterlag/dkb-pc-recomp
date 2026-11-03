@@ -9,9 +9,41 @@ from pathlib import Path
 import shutil
 import subprocess
 
-from nvn2_compute_c0_test import function
-
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def function(source, start):
+    """Extract a C body, ignoring braces in literals and comments.
+
+    The version parser checks the character '}', which is not its closing brace.
+    """
+    begin = source.index(start)
+    at = source.index('{', begin)
+    depth, quote = 0, None
+    while at < len(source):
+        ch = source[at]
+        if quote:
+            if ch == '\\':
+                at += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif source.startswith('//', at):
+            at = source.index('\n', at)
+            continue
+        elif source.startswith('/*', at):
+            at = source.index('*/', at + 2) + 2
+            continue
+        elif ch in ('"', "'"):
+            quote = ch
+        elif ch == '{':
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0:
+                return source[begin:at + 1]
+        at += 1
+    raise ValueError('unterminated C body: ' + start)
 
 
 def source():
@@ -23,7 +55,7 @@ def source():
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "nvn2_c0.h"
+#include "gfx.h"
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -32,15 +64,16 @@ def source():
 #endif
 #define NVN2_C0_LAYOUT 0x860
 #define CODE_SKIP 0x30
-enum { GFX_STAGE_VS, GFX_STAGE_FS=4, GFX_STAGE_CS };
-typedef int GfxShaderAnswers;
+#define COUNT(a) (sizeof(a)/sizeof(*(a)))
+static int host_f64=1;
+static uint32_t host_sbuf=256, host_sg[3]={32,32,32}, host_gather;
+static const char *tex_names[]={"unused"}, *fmt_names[]={"unused"};
+static char cache_dir[]="owned-test-cache";
 typedef int UseMask;
 typedef struct { const char *stage_name; uint32_t length, c1_len; const uint8_t *c1;
                  uint8_t code_hash[32], key[32], iid[32]; int final, require_c0; } Req;
-enum { GFX_RES_KINDS=4 };
-typedef struct { char *reflection; int stage, has_c0; Nvn2C0Layout c0; int nres[4]; int *res[4]; } GfxShader;
-static void rt_log(const char *message) { (void)message; }
-static void add_res(GfxShader *s, int kind, const char *o, const char *e) { (void)s; (void)kind; (void)o; (void)e; }
+void rt_log(const char *message, ...) { (void)message; }
+static int fmt_code(const char *name) { (void)name; abort(); } // This fixture has no images.
 static void reflect_spirv(GfxShader *s) { (void)s; }
 static const char *error;
 static int fail(const char *why, const char *detail) { (void)detail; error = why; return 0; }
@@ -72,9 +105,9 @@ int main(void) {
     memcpy(short_control, header, sizeof header);
     uint8_t code[8] = {0}, full[0x880] = {0};
     Req req = {0};
-    GfxShaderAnswers answers = 0;
-    int checks = 0;
-#define CHECK(c) do { checks++; if (!(c)) { fprintf(stderr, "shader control: failed check %d\n", checks); return 1; } } while (0)
+    GfxShaderAnswers answers = {0};
+    int checks = 0, failures = 0;
+#define CHECK(c) do { checks++; if (!(c)) { failures++; fprintf(stderr, "shader control: failed check %d\n", checks); } } while (0)
     CHECK(!req_init(&req, GFX_STAGE_CS, short_control, code, sizeof code, NULL, &answers) &&
           error && strstr(error, "NVN 2 program"));
     memcpy(full + NVN2_C0_LAYOUT, "DKC0", 4);
@@ -87,6 +120,17 @@ int main(void) {
     CHECK(req_init(&req, GFX_STAGE_CS, full, code, sizeof code, NULL, &answers) && req.require_c0);
     memset(full + NVN2_C0_LAYOUT, 0, 4);
     CHECK(req_init(&req, GFX_STAGE_CS, full, code, sizeof code, NULL, &answers) && !req.require_c0);
+    char request[4096];
+    memcpy(full+NVN2_C0_LAYOUT,"DKC1",4);
+    uint32_t dimensions[3]={1,1,1}; memcpy(full+0x748,dimensions,sizeof dimensions);
+    size_t request_size=build_request(request,"original","cs","original.bin",NULL,0,NULL,full);
+    CHECK(request_size==strlen(request) && json_int(request,request+request_size,"storage_candidates_version",-1)==1);
+    CHECK(json_int(request,request+request_size,"c0_version",-1)==2 && json_key(request,request+request_size,"c0_roots"));
+    build_request(request,"original","ps","original.bin",NULL,0,NULL,full);
+    CHECK(!json_key(request,request+strlen(request),"storage_candidates_version"));
+    memset(full+NVN2_C0_LAYOUT,0,4);
+    build_request(request,"original","cs","original.bin",NULL,0,NULL,full);
+    CHECK(!json_key(request,request+strlen(request),"storage_candidates_version"));
 #ifdef _WIN32
     VirtualFree(mapping, 0, MEM_RELEASE);
 #else
@@ -96,25 +140,46 @@ int main(void) {
         "{\"stage\":\"cs\"}",
         "{\"stage\":\"cs\"}",
         "{\"stage\":\"cs\",\"c0\":[7,1,2,3]}",
+        "{\"stage\":\"cs\",\"storage_candidates_version\":1,\"c0_version\":2,\"c0\":[7,1,2,3],\"c0_roots\":[3,0,5,0,0,0,0,0]}",
+        "{\"stage\":\"cs\",\"storage_candidates_version\":1,\"c0_version\":2,\"c0\":[7,1,2,3],\"c0_roots\":[65,0,0,0,0,0,0,0]}",
         "{\"stage\":\"cs\",\"c0_version\":2,\"c0\":[7,1,2,3],\"c0_roots\":[3,0,5,0,0,0,0,0]}",
-        "{\"stage\":\"cs\",\"c0_version\":2,\"c0\":[7,1,2,3],\"c0_roots\":[65,0,0,0,0,0,0,0]}"
+        "{\"stage\":\"cs\",\"storage_candidates_version\":0,\"c0_version\":2,\"c0\":[7,1,2,3],\"c0_roots\":[3,0,5,0,0,0,0,0]}",
+        "{\"stage\":\"cs\",\"storage_candidates_version\":2,\"c0_version\":2,\"c0\":[7,1,2,3],\"c0_roots\":[3,0,5,0,0,0,0,0]}",
+        "{\"stage\":\"cs\",\"storage_candidates_version\":1.5,\"c0_version\":2,\"c0\":[7,1,2,3],\"c0_roots\":[3,0,5,0,0,0,0,0]}",
+        "{\"stage\":\"cs\",\"storage_candidates_version\":1e1,\"c0_version\":2,\"c0\":[7,1,2,3],\"c0_roots\":[3,0,5,0,0,0,0,0]}",
+        "{\"stage\":\"cs\",\"sbufs\":[{\"binding\":1,\"slot\":0,\"cb_slot\":1,\"cb_offset\":0,\"flags\":128}]}",
+        "{\"stage\":\"cs\",\"storage_candidates_version\":1,\"c0_version\":2,\"c0\":[0,14,16,15],\"c0_roots\":[0,0,0,0,0,0,0,0],\"sbufs\":[{\"binding\":1,\"slot\":0,\"cb_slot\":0,\"cb_offset\":52,\"flags\":128}]}",
+        "{\"stage\":\"cs\",\"storage_candidates_version\":1,\"c0_version\":2,\"c0\":[0,14,16,15],\"c0_roots\":[0,0,0,0,0,0,0,0],\"sbufs\":[{\"binding\":1,\"slot\":0,\"cb_slot\":0,\"cb_offset\":52,\"flags\":0}]}",
+        "{\"stage\":\"ps\",\"storage_candidates_version\":1}",
+        "{\"stage\":\"cs\",\"storage_candidates_version\":1}",
+        "{\"stage\":\"cs\",\"storage_candidates_version\":0,\"sbufs\":[{\"binding\":1,\"slot\":0,\"cb_slot\":1,\"cb_offset\":0,\"flags\":128}]}"
     };
-    const int require[] = {1,0,1,1,1}, expected[] = {0,1,0,1,0};
+    const int require[] = {1,0,1,1,1,1,1,1,1,1,0,1,1,0,0,0};
+    const int expected[] = {0,1,0,1,0,0,0,0,0,0,0,1,1,0,0,0};
     for (unsigned i = 0; i < sizeof profiles / sizeof *profiles; i++) {
         GfxShader s = {.reflection=(char *)profiles[i]};
         int ok = reflect(&s, require[i]);
         CHECK(ok == expected[i] && (i != 3 || (s.has_c0 && s.c0.roots[0] == 3 && s.c0.roots[2] == 5)));
+        if (i == 11 || i == 12) {
+            CHECK(s.nres[GFX_RES_SSBO] == 1);
+            CHECK(s.res[GFX_RES_SSBO][0].handle == (i == 11 ? 52 : (0x210 + 16 * 12) / 4));
+            CHECK(s.res[GFX_RES_SSBO][0].flags == (i == 11 ? GFX_RES_SSBO_GUARDED : 0));
+        }
         for (int k = 0; k < 4; k++) free(s.res[k]);
     }
-    printf("shader control/profile: %d checks, 0 failures\n", checks);
-    return 0;
+    printf("shader control/profile: %d checks, %d failures\n", checks, failures);
+    return failures != 0;
 }
 '''
     pieces = [function(production, name) for name in (
+        'static void json_esc(', 'static uint32_t nvn2_shared(', 'static const char *attr_name(',
         'static const char *json_key(', 'static long json_int(', 'static void json_str(',
-        'static int json_objects(', 'int gfx_shader_is_nvn2(', 'static int req_init(')]
+        'static int json_objects(', 'static int handle_slot(', 'static void add_res(',
+        'static int storage_contract_version(', 'int gfx_shader_is_nvn2(', 'static int req_init(',
+        'static size_t build_request(')]
     pieces.append(function(production[production.rindex('static int reflect('):], 'static int reflect('))
-    return before + '\n'.join(pieces) + after
+    shader = function(production, 'struct GfxShader {') + ';\n'
+    return before + shader + '\n'.join(pieces) + after
 
 
 def main():

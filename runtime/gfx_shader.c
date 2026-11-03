@@ -59,8 +59,8 @@ static uint32_t nvn2_shared(const uint8_t *control) {
 #define CODE_SKIP 0x30                                     // graphics code starts after the first 0x30 bytes of the program
 #define BUCKETS 4096
 #define LINE_MAX_LEN 4096
-#define KEY_VERSION 4                                      // in every cache key; bump when the key layout or the use of the
-                                                           // output changes here (4: translator identity, input ids);
+#define KEY_VERSION 5                                      // in every cache key; bump when the key layout or the use of the
+                                                           // output changes here (5: guarded storage binding contract);
                                                            // translator changes are covered by its identity
 #define IN_VERSION 1                                       // in every input id and .in file: bump when the answers layout
                                                            // or the program hash changes (drops every stored input)
@@ -705,7 +705,8 @@ static void add_res(GfxShader *s, int kind, const char *o, const char *e) {
             // ssbo_slot reads. vk_c0_fill puts the addresses at the packed offsets the shader reads.
             int off = r->handle * 4, ub = (int)nvn2_c0_part(&s->c0, 1), sb = (int)nvn2_c0_part(&s->c0, 2),
                 end = (int)nvn2_c0_part(&s->c0, 3);
-            if (s->has_c0 && r->cbuf_slot == 0 && off >= ub && off < end && (off - ub) % 16 == 0)
+            if (!(r->flags & GFX_RES_SSBO_GUARDED) && s->has_c0 && r->cbuf_slot == 0 &&
+                off >= ub && off < end && (off - ub) % 16 == 0)
                 r->handle = (uint16_t)((off < sb ? 0x210 + (off - ub) : 0x310 + (off - sb)) / 4);
         }
         return;
@@ -804,6 +805,16 @@ out:
     free(loc), free(packed), free(ttype), free(tcomps), free(width), free(span), free(length), free(pointee);
 }
 
+// This ABI field is an exact JSON integer, not a numeric prefix such as 1.5 or 1e1. Missing means legacy version 0.
+static int storage_contract_version(const char *js, const char *end) {
+    const char *p = json_key(js, end, "storage_candidates_version");
+    if (!p) return 0;
+    if (*p != '0' && *p != '1') return -1;
+    int v = *p++ - '0';
+    while (p < end && isspace((unsigned char)*p)) p++;
+    return p < end && (*p == ',' || *p == '}') ? v : -1;
+}
+
 static int reflect(GfxShader *s, int require_c0) {
     static const char *const kinds[GFX_RES_KINDS] = {"cbufs", "sbufs", "textures", "images"};
     const char *js = s->reflection;
@@ -839,11 +850,24 @@ static int reflect(GfxShader *s, int require_c0) {
         rt_log("gfx_shader: translator omitted the NVN 2 root layout; rebuild the shader translator");
         return 0;
     }
+    int storage_version = storage_contract_version(js, end);
+    if ((require_c0 && storage_version != GFX_STORAGE_CANDIDATES_VERSION) ||
+        (storage_version && (storage_version != GFX_STORAGE_CANDIDATES_VERSION ||
+                             !require_c0 || !s->has_c0 || s->stage != GFX_STAGE_CS))) {
+        rt_log("gfx_shader: incompatible guarded storage contract; rebuild the shader translator");
+        return 0;
+    }
     for (int k = 0; k < GFX_RES_KINDS; k++) {
         int count = json_objects(js, kinds[k], NULL, s, k);
         s->res[k] = calloc(count ? count : 1, sizeof *s->res[k]);
         json_objects(js, kinds[k], add_res, s, k);
     }
+    for (int i = 0; i < s->nres[GFX_RES_SSBO]; i++)
+        if ((s->res[GFX_RES_SSBO][i].flags & GFX_RES_SSBO_GUARDED) &&
+            storage_version != GFX_STORAGE_CANDIDATES_VERSION) {
+            rt_log("gfx_shader: guarded storage resource without its versioned binding contract");
+            return 0;
+        }
     reflect_spirv(s);
     return 1;
 }
@@ -1157,7 +1181,8 @@ static size_t build_request(char *o0, const char *hex, const char *stage, const 
         o += sprintf(o, ",\"local\":[%u,%u,%u]", l[0], l[1], l[2]);
         const uint8_t *lay = control + NVN2_C0_LAYOUT;
         if (!memcmp(lay, "DKC1", 4)) {
-            o += sprintf(o, ",\"c0\":[%u,%u,%u,%u],\"c0_version\":2,\"c0_roots\":[", lay[4], lay[5], lay[6], lay[7]);
+            o += sprintf(o, ",\"storage_candidates_version\":%u,\"c0\":[%u,%u,%u,%u],\"c0_version\":2,\"c0_roots\":[",
+                         GFX_STORAGE_CANDIDATES_VERSION, lay[4], lay[5], lay[6], lay[7]);
             for (int i = 0; i < NVN2_ROOT_TABLES; i++) o += sprintf(o, "%s%u", i ? "," : "", lay[12 + i]);
             o += sprintf(o, "]");
         }

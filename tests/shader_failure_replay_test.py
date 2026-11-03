@@ -63,8 +63,10 @@ class ShaderFailureCapture(unittest.TestCase):
             start = shader.index('static const char *const ' + name)
             names.append(shader[start:shader.index(';', start) + 1])
         source = (ROOT / 'tests/shader_failure_capture.c').read_text()
-        source = source.replace('@TYPES@', '\n'.join(record(text, name) for text, name in
-                                ((header, 'GfxShaderAnswers'), (shader, 'UseMask'), (shader, 'Req'))))
+        types = [record(text, name) for text, name in
+                 ((header, 'GfxShaderAnswers'), (shader, 'UseMask'), (shader, 'Req'))]
+        types.append(re.search(r'^enum \{ GFX_STORAGE_CANDIDATES_VERSION = [^\n]+;', header, re.M).group())
+        source = source.replace('@TYPES@', '\n'.join(types))
         source = source.replace('@FUNCTIONS@', '\n'.join(names + functions))
         generated = cls.work / 'fixture.c'
         generated.write_text(source)
@@ -112,12 +114,13 @@ class ShaderFailureCapture(unittest.TestCase):
                 if stage == 4:
                     self.assertTrue(job['early_fragment_tests'])
                     self.assertEqual(job['subgroup'], 64)
-                    for key in ('c0', 'c0_version', 'c0_roots'):
+                    for key in ('c0', 'c0_version', 'c0_roots', 'storage_candidates_version'):
                         self.assertNotIn(key, job)
                 else:
                     self.assertEqual(job['local'], [4, 2, 1])
                     self.assertEqual(job['c0'], [1, 2, 3, 4])
                     self.assertEqual(job['c0_version'], 2)
+                    self.assertEqual(job['storage_candidates_version'], 1)
                     self.assertEqual(job['c0_roots'], [1, 0, 7, 4, 64, 2, 0, 9])
                 self.assertIn('writes=3', text)
 
