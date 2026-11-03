@@ -56,6 +56,11 @@ int kern_core_away(void) { return 1; }
 void kern_core_back(int *away) { *away = 0; }
 uint64_t kern_now_ns(void) { return 0; }
 // Unrelated object/observer entry points are linked but must never run in this fixture.
+uint64_t rt_ns_to_ticks(uint64_t ns) {
+    (void)ns;
+    fputs("unexpected counter timestamp conversion in WaitSync fixture\n", stderr);
+    abort();
+}
 const RtConfig *rt_config(void) { rt_fatal("unexpected configuration lookup"); return NULL; }
 const GfxBackend gfx_vulkan_backend = {0};
 void nvn_pool_flushed(const pool_t *p, uint64_t off, uint64_t size) {
