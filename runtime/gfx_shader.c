@@ -65,7 +65,7 @@ static uint32_t nvn2_shared(const uint8_t *control) {
 #define IN_VERSION 1                                       // in every input id and .in file: bump when the answers layout
                                                            // or the program hash changes (drops every stored input)
 #define USE_MAGIC 0x4d554b54u                              // "TKUM", .use files
-#define USE_VERSION 1
+#define USE_VERSION 2                                      // 2: include every array location in VS-input / FS-output masks
 #define IN_MAGIC 0x49534b54u                               // "TKSI", .in files
 #define MAX_SVC 32                                         // translator processes
 
@@ -731,7 +731,7 @@ static void add_res(GfxShader *s, int kind, const char *o, const char *e) {
 
 // SPIR-V opcodes and enumerants used below (SPIR-V 1.6 specification, section 3).
 enum { OP_ENTRY_POINT = 15, OP_EXECUTION_MODE = 16, OP_TYPE_INT = 21, OP_TYPE_FLOAT = 22, OP_TYPE_VECTOR = 23,
-       OP_TYPE_ARRAY = 28, OP_TYPE_POINTER = 32, OP_VARIABLE = 59, OP_DECORATE = 71,
+       OP_TYPE_ARRAY = 28, OP_TYPE_POINTER = 32, OP_CONSTANT = 43, OP_VARIABLE = 59, OP_DECORATE = 71,
        DEC_BUILTIN = 11, DEC_LOCATION = 30, DEC_COMPONENT = 31, SC_INPUT = 1, SC_OUTPUT = 3, EM_LOCAL_SIZE = 17 };
 
 // Interface Locations and the compute workgroup size from the module. Ids beyond 2^20 are ignored (Ryujinx modules stay
@@ -745,8 +745,9 @@ static void reflect_spirv(GfxShader *s) {
     // per id: location + 1 (0 = none), component flag, scalar/vector description of types, pointee of pointers
     int32_t *loc = calloc(bound, sizeof *loc);
     uint8_t *packed = calloc(bound, 1), *ttype = calloc(bound, 1), *tcomps = calloc(bound, 1);
+    uint8_t *width = calloc(bound, 1), *span = calloc(bound, 1), *length = calloc(bound, 1);
     uint32_t *pointee = calloc(bound, sizeof *pointee);
-    if (!loc || !packed || !ttype || !tcomps || !pointee) goto out;
+    if (!loc || !packed || !ttype || !tcomps || !width || !span || !length || !pointee) goto out;
     for (uint64_t i = 5; i < n;) {
         uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
         if (!len || i + len > n) break;
@@ -755,16 +756,34 @@ static void reflect_spirv(GfxShader *s) {
         if (op == OP_EXECUTION_MODE && len >= 6 && a[1] == EM_LOCAL_SIZE) {
             s->local[0] = a[2], s->local[1] = a[3], s->local[2] = a[4];
         } else if (op == OP_DECORATE && len >= 4 && id < bound) {
-            if (a[1] == DEC_LOCATION) loc[id] = (int32_t)a[2] + 1;
+            if (a[1] == DEC_LOCATION) loc[id] = a[2] < 32 ? (int32_t)a[2] + 1 : 0;
             else if (a[1] == DEC_COMPONENT) packed[id] = 1;
         } else if (op == OP_TYPE_INT && len >= 4 && id < bound) {
             ttype[id] = a[2] ? GFX_TYPE_SINT : GFX_TYPE_UINT, tcomps[id] = 1;
+            width[id] = a[1] == 32 || a[1] == 64 ? (uint8_t)a[1] : 0, span[id] = 1;
         } else if (op == OP_TYPE_FLOAT && len >= 3 && id < bound) {
             ttype[id] = GFX_TYPE_FLOAT, tcomps[id] = 1;
+            width[id] = a[1] == 32 || a[1] == 64 ? (uint8_t)a[1] : 0, span[id] = 1;
         } else if (op == OP_TYPE_VECTOR && len >= 4 && id < bound && a[1] < bound) {
             ttype[id] = ttype[a[1]], tcomps[id] = (uint8_t)a[2];
+            width[id] = width[a[1]], span[id] = span[a[1]] && a[2] >= 2 && a[2] <= 4;
+        } else if (op == OP_CONSTANT && len >= 4 && a[0] < bound && a[1] < bound) {
+            uint32_t type = a[0], value = a[2];
+            if (ttype[type] != GFX_TYPE_FLOAT && tcomps[type] == 1 &&
+                ((width[type] == 32 && len == 4 && value &&
+                  (ttype[type] == GFX_TYPE_UINT || !(value >> 31))) ||
+                 (width[type] == 64 && len == 5 && (value || a[3]) &&
+                  (ttype[type] == GFX_TYPE_UINT || !(a[3] >> 31)))))
+                length[a[1]] = (width[type] == 64 && a[3]) || value > 32 ? 32 : (uint8_t)value;
         } else if (op == OP_TYPE_ARRAY && len >= 4 && id < bound && a[1] < bound) {
-            ttype[id] = ttype[a[1]], tcomps[id] = tcomps[a[1]];   // element type (arrayed interface blocks)
+            ttype[id] = ttype[a[1]], tcomps[id] = tcomps[a[1]], width[id] = width[a[1]];
+            // A scalar/vector array consumes one location per element, including nested arrays (Vulkan Shader
+            // Interfaces, Location and Component Assignment). Cap each factor before multiplying: only 32 slots
+            // fit our reflection. Unknown lengths and element widths GfxShaderIo cannot describe stay unsupported.
+            if (width[id] == 32 && a[2] < bound) {
+                uint32_t slots = (uint32_t)span[a[1]] * length[a[2]];
+                span[id] = slots > 32 ? 32 : (uint8_t)slots;
+            }
         } else if (op == OP_TYPE_POINTER && len >= 4 && id < bound) {
             pointee[id] = a[2];
         } else if (op == OP_VARIABLE && len >= 4) {
@@ -773,14 +792,16 @@ static void reflect_spirv(GfxShader *s) {
                 int l = loc[var] - 1;
                 uint32_t t = pointee[type] < bound ? pointee[type] : 0;
                 GfxShaderIo io = {ttype[t], tcomps[t] ? tcomps[t] : 4, packed[var]};
-                if (sc == SC_INPUT) s->in_mask |= 1u << l, s->in[l] = io;
-                else s->out_mask |= 1u << l, s->out[l] = io;
+                for (uint32_t j = 0; j < span[t] && l + j < 32; j++) {
+                    if (sc == SC_INPUT) s->in_mask |= 1u << (l + j), s->in[l + j] = io;
+                    else s->out_mask |= 1u << (l + j), s->out[l + j] = io;
+                }
             }
         }
         i += len;
     }
 out:
-    free(loc), free(packed), free(ttype), free(tcomps), free(pointee);
+    free(loc), free(packed), free(ttype), free(tcomps), free(width), free(span), free(length), free(pointee);
 }
 
 static int reflect(GfxShader *s, int require_c0) {
