@@ -154,6 +154,7 @@ static PlatCond rcv = PLAT_COND_INIT;   // item queued, item taken, item done
 static ReplayItem rq[RQ_CAP];
 static int rq_head, rq_n, r_busy, r_started;
 static uint64_t r_presents_queued, r_presents_done, r_submit_done, game_frames;
+static uint64_t r_items_queued, r_items_done;   // every item, for replay_drain
 // Under rl: calls, calls that waited and the time waited per cause, since the last replay_log line and over the run.
 static uint64_t dr_calls[DR_N], dr_waits[DR_N], dr_ns[DR_N], dr_tcalls[DR_N], dr_twaits[DR_N], dr_tns[DR_N];
 // TOTK_REPLAY_CHECK: ReadTexels compared with a read after a full drain (under rl): checked, differing, differing
@@ -218,6 +219,7 @@ static void replay_main(void *arg) {
         plat_mutex_lock(&rl);
         if (it.kind == RI_SUBMIT) r_submit_done = it.submit_no;
         else r_presents_done++;
+        r_items_done++;
         r_busy = 0;
         plat_cond_broadcast(&rcv);
     }
@@ -266,20 +268,25 @@ static uint64_t replay_enqueue(ReplayItem *it) {
     it->value = it->kind == RI_RELEASE ? 0 : vk_sync_reserve();   // a release signals nothing
     rq[(rq_head + rq_n) % RQ_CAP] = *it;
     rq_n++;
+    r_items_queued++;
     plat_cond_broadcast(&rcv);
     plat_mutex_unlock(&rl);
     return it->value;
 }
 
-// Returns once every queued item was replayed and submitted. Back-end entries only: the replay thread never calls them.
+// Returns once every item queued before the call was replayed and submitted. Back-end entries only: the replay thread
+// never calls them. Waiting for an empty queue instead starved: the render thread queues a submission and a present
+// every frame, so the queue was empty only between two of them, and a pool finalize on another thread waited for
+// seconds (Bananza's loading screen stayed black).
 static void replay_drain(int why) {
     if (!gfx_replay_async()) return;
     plat_mutex_lock(&rl);
     dr_calls[why]++, dr_tcalls[why]++;
-    if (rq_n || r_busy) {
+    uint64_t upto = r_items_queued;
+    if (r_items_done < upto) {
         uint64_t p0 = perf_begin();
         int away = core_away_unlocked();
-        while (rq_n || r_busy) plat_cond_wait(&rcv, &rl);
+        while (r_items_done < upto) plat_cond_wait(&rcv, &rl);
         wait_counted(why, p0);
         core_back_unlocked(&away);
     }
