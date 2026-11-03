@@ -1,4 +1,4 @@
-"""Compile the runtime's own GLSL shaders (runtime/shaders/*.comp) into C headers of SPIR-V words.
+"""Compile the runtime's own GLSL and SPIR-V assembly shaders into C headers of SPIR-V words.
 
 Each runtime/shaders/<name>.comp becomes runtime/<name>_spv.h, which declares `static const uint32_t <name>_spv[]`
 and records the SHA-256 of the source it came from. The headers are committed, so building totk.exe needs no shader
@@ -46,18 +46,26 @@ def header_path(src):
 def stale(runtime):
     """Shader sources under runtime/shaders whose header is missing or records another source hash."""
     out = []
-    for src in sorted((runtime / 'shaders').glob('*.comp')):
+    for src in shader_sources(runtime):
         h = header_path(src)
         if not h.exists() or f'// source sha256 {source_hash(src)}' not in h.read_text(encoding='utf-8'):
             out.append(src)
     return out
 
 
+def shader_sources(runtime):
+    return sorted([*(runtime / 'shaders').glob('*.comp'), *(runtime / 'shaders').glob('*.spvasm')])
+
+
 def compile_one(src):
     with tempfile.TemporaryDirectory() as tmp:
         spv = Path(tmp) / 'out.spv'
-        subprocess.run([str(BIN / 'glslc.exe') if WIN else 'glslc', '-O', f'--target-env={TARGET}', '-fshader-stage=compute',
-                        '-o', str(spv), str(src)], check=True)
+        if src.suffix == '.spvasm':
+            subprocess.run([str(BIN / 'spirv-as.exe') if WIN else 'spirv-as', '--target-env', TARGET,
+                            '-o', str(spv), str(src)], check=True)
+        else:
+            subprocess.run([str(BIN / 'glslc.exe') if WIN else 'glslc', '-O', f'--target-env={TARGET}', '-fshader-stage=compute',
+                            '-o', str(spv), str(src)], check=True)
         subprocess.run([str(BIN / 'spirv-val.exe') if WIN else 'spirv-val', f'--target-env', TARGET, str(spv)], check=True)
         data = spv.read_bytes()
     words = [int.from_bytes(data[i:i + 4], 'little') for i in range(0, len(data), 4)]
@@ -75,7 +83,7 @@ def main():
         for s in bad:
             print(f'{header_path(s)}: stale, run tools/build_shaders.py')
         return 1 if bad else 0
-    for src in sorted((args.runtime / 'shaders').glob('*.comp')):
+    for src in shader_sources(args.runtime):
         compile_one(src)
     return 0
 

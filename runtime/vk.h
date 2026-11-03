@@ -498,4 +498,10 @@ void vk_pipeline_shutdown(void);           // waits for background builds, saves
                                            // cache; before vk_shutdown
 int vk_pipeline_selftest(void);            // one graphics and one compute pipeline from census shaders; 0 on success
 
+// Original fixed-function clear helper. Caller supplies a one-layer view and orders it with surrounding work.
+void vk_clear_stencil_masked(VkCommandBuffer cb, VkFormat format, uint32_t samples, VkImageAspectFlags aspect,
+                             VkImageView view, uint32_t width, uint32_t height, VkRect2D scissor,
+                             uint32_t mask, uint32_t value);
+void vk_clear_shutdown(VkDevice device);   // after device idle, before destroying the device
+
 #include "vk_rec.h"   // last: its macros route the vkCmd* calls of every file that includes vk.h

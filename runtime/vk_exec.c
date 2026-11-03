@@ -95,7 +95,7 @@ WEAK void vk_exec_op_xfer(VkExec *ex, uint32_t op, const void *payload) {
     rt_fatal("vk: op %s is not replayed yet", nvn_op_name(op));
 }
 
-enum { W_UNRENDERABLE, W_LEVEL, W_LAYER, W_VIEW_FORMAT, W_BLOCK_VIEW, W_BLOCK_LAYERS, W_CLEAR_TARGET, W_CLEAR_MASK, W_STENCIL_MASK, W_COUNT };
+enum { W_UNRENDERABLE, W_LEVEL, W_LAYER, W_VIEW_FORMAT, W_BLOCK_VIEW, W_BLOCK_LAYERS, W_CLEAR_TARGET, W_CLEAR_MASK, W_COUNT };
 
 static void warn_once(int key, const char *fmt, ...) {
     static volatile int32_t seen[W_COUNT];
@@ -740,7 +740,29 @@ static void clear_ds(VkExec *ex, const p_clear_ds *c) {
     uint32_t sm = (uint32_t)c->stencil_mask & 0xff;
     if (sm && (t->aspect & VK_IMAGE_ASPECT_STENCIL_BIT)) {
         if (sm == 0xff) asp |= VK_IMAGE_ASPECT_STENCIL_BIT;
-        else warn_once(W_STENCIL_MASK, "stencil clear with mask %#x is not replayed: skipped", sm);
+        else {
+            VkRect2D scissor = vk_exec_scissor(ex);
+            if (scissor.extent.width && scissor.extent.height) {
+                // ClearAttachments ignores the write mask. Draw into each layer with ALWAYS/REPLACE instead,
+                // preserving the depth plane and the stencil bits outside sm. A separate pass also excludes the
+                // clear's fragments from the game's occlusion queries and avoids touching its colour targets.
+                vk_exec_barrier(ex);
+                VkExecTarget layer = *t;
+                layer.layers = 1;
+                layer.view_type = VK_IMAGE_VIEW_TYPE_2D;
+                for (uint32_t i = 0; i < t->layers; i++) {
+                    layer.base_layer = t->base_layer + i;
+                    vk_clear_stencil_masked(ex->cb, t->format, t->samples, t->aspect, view_of(ex, &layer),
+                                             ex->pass_w, ex->pass_h, scissor, sm, (uint32_t)c->stencil);
+                    ex->recorded += 9;
+                    vk_exec_frame.passes++;
+                }
+                vk_texture_gpu_written(t->tex);
+                vk_exec_draw_new_cb();
+                ex->dirty = VK_EXEC_DIRTY_ALL;
+                vk_exec_barrier(ex);
+            }
+        }
     }
     if (!asp) return;
     float d = c->depth < 0.0f ? 0.0f : c->depth > 1.0f ? 1.0f : c->depth;
