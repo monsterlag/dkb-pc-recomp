@@ -5,7 +5,8 @@ invalidate, guest-read, texture-writeback, SyncWait and FlushMappedRange code wi
 adapter. A GPU fence becoming complete and a readback copying its result are separate events.
 
 Usage: python tests/vk_guest_read_writeback_test.py --cc /path/to/clang [--revision COMMIT]
-The original deferred implementation fails the race case. Its synchronous predecessor and both controls pass.
+The default and explicit-off modes must pass. Explicit-on with async replay retains the known P1 race and must
+remain RED until deferred guest-memory commits are made coherent; its assertions are unchanged.
 """
 import argparse
 import hashlib
@@ -34,6 +35,10 @@ def main():
     parser.add_argument('--cc', default=os.environ.get('CC') or shutil.which('clang'))
     parser.add_argument('--revision', help='read production source from this Git revision')
     parser.add_argument('--runs', type=int, default=10)
+    parser.add_argument('--nowait', choices=('default', '0', '1'), default='default')
+    parser.add_argument('--replay-async', choices=('0', '1'), default='1')
+    parser.add_argument('--setting-source', choices=('env', 'ini'), default='env')
+    parser.add_argument('--game-version', type=int, choices=(0, 143), default=0)
     args = parser.parse_args()
     if os.name != 'nt':
         parser.error('this fixture requires Windows write-watch')
@@ -42,14 +47,15 @@ def main():
     revision = subprocess.check_output(
         ['git', 'rev-parse', '--verify', '--end-of-options', args.revision + '^{commit}'],
         cwd=ROOT, text=True).strip() if args.revision else None
-    out = ROOT/'build'/'tests'/'vk-guest-read-writeback'/(revision[:12] if revision else 'working')
+    mode = f'nowait-{args.nowait}-replay-{args.replay_async}-{args.setting_source}-game{args.game_version}'
+    out = ROOT/'build'/'tests'/'vk-guest-read-writeback'/(revision[:12] if revision else 'working')/mode
     out.mkdir(parents=True, exist_ok=True)
 
     def source(name):
         path = 'runtime/' + name
         return subprocess.check_output(['git', 'show', f'{revision}:{path}'], cwd=ROOT, text=True) if revision else (ROOT/path).read_text()
 
-    names = ('vk_backend.c', 'vk_texture.c', 'vk_memory.c', 'nvn_api_core.c', 'nvn_ext.c', 'nvn_tex.c', 'tex_deswizzle.c')
+    names = ('vk_backend.c', 'vk_texture.c', 'vk_memory.c', 'nvn_api_core.c', 'nvn_ext.c', 'nvn_tex.c', 'tex_deswizzle.c', 'cfg.c')
     sources = {name: source(name) for name in names}
     bodies, extracted = [], []
 
@@ -82,6 +88,8 @@ def main():
             r'typedef struct \{ uint64_t addr, size, fence; \} NowaitSeen;', backend).group())
         add('vk_backend.c', 'static int nowait_covered(')
         add('vk_backend.c', 'static int read_nowait(')
+    add('vk_backend.c', 'int vk_replay_async(')
+    add('vk_backend.c', 'int gfx_replay_async(')
     add('vk_backend.c', 'static void vk_be_guest_read(')
     add('nvn_ext.c', 'void nvn_pool_invalidate(')
     add('nvn_ext.c', 'NVN_API(nvnMemoryPoolInvalidateMappedRange)')
@@ -92,28 +100,47 @@ def main():
         fixture = fixture.replace('/* ' + marker + ' */', value)
     (out/'fixture.c').write_text(fixture)
     (out/'nvn_tex.c').write_text(sources['nvn_tex.c'])
+    (out/'cfg.c').write_text(sources['cfg.c'])
     deswizzle = sources['tex_deswizzle.c']
     if deswizzle.count('#include "tex.h"') != 1:
         raise ValueError('deswizzle include adapter no longer matches')
     # Include adapter only; the real layout and copy functions are compiled without body edits.
     (out/'tex_deswizzle.c').write_text(deswizzle.replace('#include "tex.h"', '#include "nvn_tex.h"'))
     results = []
+    env = os.environ.copy()
+    for key in ('TOTK_NX2_READ_NOWAIT', 'DKB_NX2_READ_NOWAIT', 'TOTK_REPLAY_ASYNC', 'DKB_REPLAY_ASYNC',
+                'TOTK_DEVICE_PROFILE', 'DKB_DEVICE_PROFILE'):
+        env.pop(key, None)
+    env['TOTK_DEVICE_PROFILE'] = 'desktop'
+    settings = {'replay_async': args.replay_async}
+    if args.nowait != 'default':
+        settings['nx2_read_nowait'] = args.nowait
+    extra = []
+    if args.setting_source == 'ini':
+        ini = out/'fixture.ini'
+        ini.write_text('[diagnostics]\n' + ''.join(f'{key} = {value}\n' for key, value in settings.items()))
+        extra = [str(ini)]
+    else:
+        env.update({'TOTK_'+key.upper(): value for key, value in settings.items()})
     for optimization in ('-O0', '-O2'):
         exe = out/('vk_guest_read_writeback' + optimization[1:] + '.exe')
         command = [args.cc, '-std=gnu11', optimization, '-Wall', '-Wextra', '-Werror',
-                   '-fno-strict-aliasing', '-I', str(ROOT/'runtime'), str(out/'fixture.c'),
-                   str(out/'nvn_tex.c'), str(out/'tex_deswizzle.c'), '-o', str(exe)]
+                   '-fno-strict-aliasing', '-ffunction-sections', '-fdata-sections', '-Wl,--gc-sections',
+                   '-DTEST_GAME_VERSION='+str(args.game_version), '-I', str(ROOT/'runtime'), str(out/'fixture.c'),
+                   str(out/'cfg.c'), str(out/'nvn_tex.c'), str(out/'tex_deswizzle.c'), '-o', str(exe)]
         subprocess.run(command, check=True)
         for scenario in ('race', 'before', 'stable'):
             rows = []
             for _ in range(args.runs):
-                result = subprocess.run([str(exe), scenario], capture_output=True, text=True, timeout=15)
+                result = subprocess.run([str(exe), scenario, *extra], env=env, capture_output=True, text=True, timeout=15)
                 rows.append({'exit': result.returncode, 'output': result.stdout + result.stderr})
             failures = sum(row['exit'] != 0 for row in rows)
             print(f'{optimization} {scenario}: {len(rows) - failures}/{len(rows)} pass; {rows[0]["output"].strip()}')
             results.append({'optimization': optimization, 'scenario': scenario, 'runs': rows})
     (out/'results.json').write_text(json.dumps({
         'revision': revision or 'working tree',
+        'config_mode': mode,
+        'remaining_known_P1': args.nowait == '1' and args.replay_async == '1' and args.game_version == 0,
         'source_sha256': {name: hashlib.sha256(text.encode()).hexdigest() for name, text in sources.items()},
         'extracted_functions': extracted,
         'fixture_sha256': hashlib.sha256(fixture.encode()).hexdigest(),

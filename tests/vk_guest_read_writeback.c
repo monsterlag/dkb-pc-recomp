@@ -7,9 +7,13 @@
 #include <string.h>
 #include "nvn_api.h"
 #include "nvn_tex.h"
+#include "cfg.h"
 #include "platform/platform.h"
 
-const int rt_game_version = 0;
+#ifndef TEST_GAME_VERSION
+#define TEST_GAME_VERSION 0
+#endif
+const int rt_game_version = TEST_GAME_VERSION;
 unsigned rt_trace;
 static int checks, failures;
 #define REQUIRE(c, why) do { if (!(c)) { fprintf(stderr, "fixture: %s\n", why); ExitProcess(2); } } while (0)
@@ -26,7 +30,7 @@ static int reader_returned, allow_cpu, cpu_done, wait_entered, wait_release, ret
 static uint64_t done = 4;
 static const uint64_t producer_fence = 5;
 static HANDLE replay_worker;
-static int small_pending;
+static int small_pending, unknown_config;
 static volatile int32_t n_kept;
 enum { DR_GUEST_READ, DR_N };
 static uint64_t dr_calls[DR_N], dr_tcalls[DR_N], dr_waits[DR_N], dr_twaits[DR_N], dr_ns[DR_N], dr_tns[DR_N];
@@ -62,13 +66,29 @@ static void unlock(void) { ReleaseSRWLockExclusive(&texture_lock); }
 void rt_fatal(const char *fmt, ...) {
     va_list a; va_start(a, fmt); vfprintf(stderr, fmt, a); va_end(a); fputc('\n', stderr); ExitProcess(70);
 }
-void rt_log(const char *fmt, ...) { (void)fmt; }
+void rt_log(const char *fmt, ...) { if (strstr(fmt, "unknown key")) unknown_config++; }
 void nvn_called(uint8_t *seen, const char *name) { (void)seen; (void)name; }
 int kern_core_away(void) { return 1; }
 void kern_core_back(int *away) { *away = 0; }
+// Real cfg.c reads only the runner's owned ini. Save/default-location paths must never run in this fixture.
+uint8_t *plat_file_read(const char *path, uint64_t *size) {
+    FILE *file = fopen(path, "rb");
+    if (!file) return NULL;
+    REQUIRE(!fseek(file, 0, SEEK_END), "seek owned ini");
+    long length = ftell(file);
+    REQUIRE(length >= 0 && length < (1 << 20) && !fseek(file, 0, SEEK_SET), "owned ini size");
+    uint8_t *bytes = malloc((size_t)length + 1);
+    REQUIRE(bytes && fread(bytes, 1, (size_t)length, file) == (size_t)length, "read owned ini");
+    fclose(file); bytes[length] = 0; *size = (uint64_t)length;
+    return bytes;
+}
+int plat_file_exists(const char *path) { (void)path; rt_fatal("unexpected cfg save"); return 0; }
+int64_t plat_file_size(const char *path) { (void)path; rt_fatal("unexpected cfg save"); return 0; }
+int plat_file_write_atomic(const char *path, const void *data, size_t n) {
+    (void)path; (void)data; (void)n; rt_fatal("unexpected cfg save"); return 0;
+}
+int plat_exe_path(char *out, size_t cap) { (void)out; (void)cap; rt_fatal("unexpected default ini lookup"); return 0; }
 uint64_t kern_now_ns(void) { return 0; }
-const char *cfg_get(const char *name) { return !strcmp(name, "TOTK_NX2_READ_NOWAIT") ? "1" : NULL; }
-int cfg_bool(const char *name) { (void)name; return 1; }
 static void log_limited(volatile int32_t *n, const char *fmt, ...) { (void)n; (void)fmt; }
 static void flush_note(int kind, const pool_t *p, uint64_t size) { (void)kind; (void)p; (void)size; abort(); }
 static uint32_t mip(uint32_t size, unsigned level) { size >>= level; return size ? size : 1; }
@@ -99,12 +119,11 @@ static int backend_wait(uint64_t value, uint64_t timeout) {
     REQUIRE(backend_done() >= value, "released fence is complete");
     return 1;
 }
-static const GfxBackend backend = {
+const GfxBackend gfx_vulkan_backend = {
     .guest_written = vk_be_guest_written, .guest_read = vk_be_guest_read, .fence_done = backend_done,
     .fence_wait = backend_wait, .cpu_synced = vk_be_cpu_synced,
 };
-const GfxBackend *gfx_backend(void) { return &backend; }
-int gfx_replay_async(void) { return 1; }
+const GfxBackend *gfx_backend(void) { return &gfx_vulkan_backend; }
 void vk_sync_start(void) {}
 void vk_present_drain(void) {}
 uint64_t vk_sync_fence_done(void) { return backend_done(); }
@@ -189,10 +208,17 @@ static void join(HANDLE thread) {
 }
 
 int main(int argc, char **argv) {
-    REQUIRE(argc == 2, "select race, before or stable");
+    REQUIRE(argc == 2 || argc == 3, "select race, before or stable, with an optional owned ini");
+    if (argc == 3) REQUIRE(cfg_load(argv[2]), "read the fixture's own settings file");
+    const CfgMeta *meta = cfg_meta("NX2_READ_NOWAIT");
+    CHECK(meta && !strcmp(meta->def, "0") && !meta->live, "read-without-wait is registered as default-off/restart-only");
+    CHECK(!unknown_config, "fixture ini setting is known");
     is_before = !strcmp(argv[1], "before");
     is_race = !strcmp(argv[1], "race");
     REQUIRE(is_before || is_race || !strcmp(argv[1], "stable"), "recognized scenario");
+    const char *explicit_nowait = cfg_get("TOTK_NX2_READ_NOWAIT");
+    int expect_deferred = !rt_game_version && gfx_replay_async() && explicit_nowait &&
+        *explicit_nowait && strcmp(explicit_nowait, "0");
     nvn_texdesc descriptor = {.target = NVN_TEXTURE_TARGET_2D, .format = NVN_FORMAT_RGBA8,
         .flags = NVN_TEXTURE_FLAGS_LINEAR, .width = 256, .height = 256, .depth = 1, .levels = 1, .stride = 1024};
     nvn_texlayout layout;
@@ -217,7 +243,7 @@ int main(int argc, char **argv) {
     REQUIRE(caller, "start invalidating caller");
 
     plat_mutex_lock(&latch);
-    while (!reader_returned && !wait_entered) plat_cond_wait(&changed, &latch);
+    while (!reader_returned && !wait_entered && !image_entered) plat_cond_wait(&changed, &latch);
     int deferred = reader_returned;
     __atomic_store_n(&done, producer_fence, __ATOMIC_RELEASE);
     wait_release = 1;
@@ -240,6 +266,8 @@ int main(int argc, char **argv) {
     plat_mutex_unlock(&latch);
     join(caller);
     if (replay_worker) join(replay_worker);
+    CHECK(!!replay_worker == !!expect_deferred, "only the explicit async opt-in queues a background guest-memory commit");
+    CHECK(returned_before_copy == (!is_before && !!expect_deferred), "default/off invalidate waits for its readback before returning");
     uint8_t expected = is_before || is_race ? 0x77 : 0x22;
     CHECK(all_bytes(storage, layout.size, expected), "all guest bytes preserve the newest logical writer");
     CHECK(image_calls == (is_before ? 0 : 1), "before-write and no-write controls use the real generation check");
