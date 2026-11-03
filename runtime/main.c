@@ -166,12 +166,18 @@ void rt_udf(Cpu *c, uint64_t pc) {
              ldr_describe(c->x[30], lr, sizeof lr));
 }
 
-// CNTPCT_EL0: the Switch counter runs at 19.2 MHz. The scale is set before main, so no thread reads it half written.
+// CNTPCT_EL0: the Switch counter runs at 19.2 MHz, the Switch 2's at 31.25 MHz (Bananza's SDK converts with 31250000 /
+// 10^9 in nn::os::detail::TickManager::ConvertToTick). With 19.2 MHz ticks Bananza measured its frames 1.6 times too
+// long and paced itself at 20 FPS. The scale is set before main, so no thread reads it half written.
 static PlatScale tick_scale;
 
-__attribute__((constructor)) static void tick_scale_init(void) { tick_scale = plat_scale(19200000u, plat_counter_hz()); }
+uint32_t rt_tick_hz(void) { return rt_game_version ? 19200000u : 31250000u; }
+
+__attribute__((constructor)) static void tick_scale_init(void) { tick_scale = plat_scale(rt_tick_hz(), plat_counter_hz()); }
 
 uint64_t rt_ticks(void) { return plat_scaled(tick_scale, plat_counter()); }
+uint64_t rt_ticks_to_ns(uint64_t t) { return (uint64_t)((unsigned __int128)t * 1000000000u / rt_tick_hz()); }
+uint64_t rt_ns_to_ticks(uint64_t ns) { return (uint64_t)((unsigned __int128)ns * rt_tick_hz() / 1000000000u); }
 
 // ---- crash reporter
 typedef struct { uintptr_t host; uint64_t guest; } FnRev;

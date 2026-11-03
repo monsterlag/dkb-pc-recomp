@@ -55,8 +55,8 @@ NVN_API(nvnDeviceIsExternalDebuggerAttached) { ret_x(c, 0); }
 // void nvnDeviceSetAutomaticCheckpointsMask(NVNdevice *d, uint32_t mask) (NVN 55, no prototype in nvn.h)
 NVN_API(nvnDeviceSetAutomaticCheckpointsMask) { (void)c; }
 
-// ---------- timestamps: counters are written in Tegra 19.2 MHz ticks, the base of GetSystemTick (rt_ticks)
-static uint64_t ticks_to_ns(uint64_t t) { return t / 12 * 625 + t % 12 * 625 / 12; }
+// ---------- timestamps: counters are written in guest counter ticks, the base of GetSystemTick (rt_ticks, rt_tick_hz)
+static uint64_t ticks_to_ns(uint64_t t) { return rt_ticks_to_ns(t); }
 // uint64_t nvnDeviceGetCurrentTimestampInNanoseconds(const NVNdevice *d)
 NVN_API(nvnDeviceGetCurrentTimestampInNanoseconds) { ret_x(c, ticks_to_ns(rt_ticks())); }
 // uint64_t nvnDeviceGetTimestampInNanoseconds(const NVNdevice *d, const NVNcounterData *counter)

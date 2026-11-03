@@ -38,6 +38,9 @@ void rt_svc(Cpu *c, uint32_t imm, uint64_t pc);
 void rt_brk(Cpu *c, uint32_t imm, uint64_t pc) __attribute__((noreturn));
 void rt_udf(Cpu *c, uint64_t pc) __attribute__((noreturn));
 uint64_t rt_ticks(void);
+uint32_t rt_tick_hz(void);   // the guest counter rate: 19.2 MHz (Switch), 31.25 MHz (Switch 2)
+uint64_t rt_ticks_to_ns(uint64_t ticks);
+uint64_t rt_ns_to_ticks(uint64_t ns);
 
 #if defined(__aarch64__)
 static inline uint64_t rt_get_fpcr(void) { uint64_t v; __asm__ volatile("mrs %0, fpcr" : "=r"(v)); return v; }

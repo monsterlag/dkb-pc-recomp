@@ -210,9 +210,9 @@ static void ov_set_balance(Cpu *c) {
     plat_mutex_unlock(&lock);
 }
 
-// TimeSpan GetProgramTotalActiveTime(): nanoseconds since the process started (19.2 MHz ticks * 625 / 12)
+// TimeSpan GetProgramTotalActiveTime(): nanoseconds since the process started
 static void ov_active_time(Cpu *c) {
-    ret_x(c, (uint64_t)((unsigned __int128)(rt_ticks() - start_ticks) * 625 / 12));
+    ret_x(c, rt_ticks_to_ns(rt_ticks() - start_ticks));
 }
 
 // void SetUserInactivityDetectionTimeExtended[Unsafe](bool): the host never puts the console to sleep
