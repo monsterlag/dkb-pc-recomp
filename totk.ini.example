@@ -217,6 +217,9 @@
 # romfs_mods =
 
 [diagnostics]
+# Experimental Switch 2 reads of up to 4 KiB without waiting; requires replay_async = 1. Opt-in only: its background
+# write-back can overwrite mapped CPU writes made after invalidate returns. Keep 0 for synchronous read-back.
+# nx2_read_nowait = 0
 # Extra lines in the log, comma separated: svc, host, ipc, fs, gfx, perf, sched, audio, present or all. The menu's
 # Performance log sets perf (frame timings). Default: none.
 # trace = perf

@@ -484,7 +484,8 @@ static void vk_be_guest_written(uint64_t addr, uint64_t size) { vk_sync_start();
 // A Switch 2 game's small read of a target the GPU is still rendering does not wait on the console: the CPU sees what is
 // in memory, and the GPU's write lands when it gets there. Bananza invalidates 128 bytes of a pool every frame, and
 // waiting here held it for the replay and GPU work of the whole frame, about 15 ms of every frame. The write-back goes to the replay thread instead, queued after the submissions the
-// read would have waited for. TOTK_NX2_READ_NOWAIT=0 waits as before.
+// read would have waited for. This is opt-in with TOTK_NX2_READ_NOWAIT=1: a deferred copy can overwrite a later CPU
+// write after invalidate returned. The default keeps the synchronous read-back even with TOTK_REPLAY_ASYNC=1.
 #define NOWAIT_MAX 4096
 #define NOWAIT_SEEN 8
 
@@ -525,8 +526,12 @@ int vk_backend_selftest(void) {
 
 static int read_nowait(uint64_t addr, uint64_t size, uint64_t f) {
     static int on = -1;
-    if (on < 0) on = !rt_game_version && (!cfg_get("TOTK_NX2_READ_NOWAIT") || cfg_bool("TOTK_NX2_READ_NOWAIT"));
-    if (!on || size > NOWAIT_MAX) return 0;
+    int enabled = __atomic_load_n(&on, __ATOMIC_ACQUIRE);
+    if (enabled < 0) {
+        enabled = !rt_game_version && cfg_bool("TOTK_NX2_READ_NOWAIT");
+        __atomic_store_n(&on, enabled, __ATOMIC_RELEASE);
+    }
+    if (!enabled || size > NOWAIT_MAX) return 0;
     static PlatMutex m = PLAT_MUTEX_INIT;
     static NowaitSeen seen[NOWAIT_SEEN];
     static unsigned next;
