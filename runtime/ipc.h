@@ -39,8 +39,8 @@ typedef struct {
 typedef struct IpcSession IpcSession;
 typedef void (*IpcHandler)(IpcSession *s, const IpcRequest *rq, IpcResponse *rs);
 
-// One server object. Every kernel handle to it (the first one, CloneCurrentObject copies) holds a reference; the
-// last CloseHandle calls close(state).
+// One server object. Every kernel handle (including CloneCurrentObject copies) and in-flight request holds a
+// reference; the last release calls close(state).
 struct IpcSession {
     const char *name;
     IpcHandler handler;
@@ -50,6 +50,7 @@ struct IpcSession {
 };
 
 uint32_t ipc_session_new(const char *name, IpcHandler handler, void *state, void (*close)(void *state));   // handle
+void ipc_session_release(IpcSession *session);              // outside the kernel lock; may call close(state)
 void ipc_out(IpcResponse *rs, const void *p, uint32_t n);
 const void *ipc_arg(const IpcRequest *rq, uint32_t off, uint32_t n);
 void *ipc_guest(uint64_t addr, uint64_t size);   // a client buffer as a host pointer (identity map), range checked

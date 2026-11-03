@@ -3,7 +3,7 @@
 //   totk.exe [--exefs DIR] [--romfs DIR] [--profile DIR] <mode>
 //     --selftest        layout, dispatch table and host-function registry; needs no game files
 //     --probe-loader    load and relocate the modules, check them against the measured 1.2.1 values
-//     --probe-kernel, --probe-ipc, --probe-services, --probe-fs    host probes
+//     --probe-kernel, --probe-ipc, --probe-ipc-lifetime, --probe-services, --probe-fs    host probes
 //     --probe-dpi       the process DPI awareness (per-monitor v2) and the primary monitor's size; no game files
 //     --probe-gfx-abi   NVN object layouts against nvn.h's reserved sizes; needs no game files
 //     --probe-nvn, --probe-nvn-tex, --probe-window, --probe-shader, --probe-vkmem, --probe-vkexec    graphics probes
@@ -432,7 +432,7 @@ static int selftest(void) {
 
 static int usage(const char *argv0) {
     fprintf(stderr, "usage: %s [--exefs DIR] [--romfs DIR] [--profile DIR] [--selftest | --probe-loader | "
-                    "--probe-cfg | --probe-dpi | --probe-kernel | --probe-ipc | --probe-services | --probe-fs | --probe-gfx-abi | "
+                    "--probe-cfg | --probe-dpi | --probe-kernel | --probe-ipc | --probe-ipc-lifetime | --probe-services | --probe-fs | --probe-gfx-abi | "
                     "--probe-nvn | --probe-nvn-tex | --probe-window | --probe-shader | --probe-vkmem | "
                     "--probe-vkexec | --probe-astc | --probe-movie | --prepare-shaders | --warm-shaders | --boot |--seconds S [--shot PNG]]\n", argv0);
     return 2;
@@ -525,6 +525,7 @@ int main(int argc, char **argv) {
 #endif
     if (!strcmp(mode, "--probe-kernel")) return probe_kernel();
     if (!strcmp(mode, "--probe-ipc")) return probe_ipc();
+    if (!strcmp(mode, "--probe-ipc-lifetime")) return probe_ipc_lifetime();
     if (!strcmp(mode, "--probe-services")) return probe_services();
     if (!strcmp(mode, "--probe-fs")) return probe_fs();
     if (!strcmp(mode, "--probe-gfx-abi")) return probe_gfx_abi();

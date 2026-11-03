@@ -2015,6 +2015,14 @@ void *kern_handle_get(uint32_t h, int kind) {
     return o;
 }
 
+struct IpcSession *kern_session_acquire(uint32_t h) {
+    lock();
+    struct IpcSession *s = h_peek(h, O_SESSION);
+    if (s) ipc_session_retain(s);
+    unlock();
+    return s;
+}
+
 uint32_t kern_event_new(void) {
     Event *e = calloc(1, sizeof *e);
     if (!e) rt_fatal("kernel: event allocation");

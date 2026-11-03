@@ -217,6 +217,8 @@ void kern_core_diag_frame(uint64_t frame, uint64_t interval_ns);   // perf_prese
 void kern_sched_report(uint64_t frame);                    // TOTK_TRACE=sched: per-thread time split, on present
 uint32_t kern_handle_new(int kind, void *obj);             // kind: KERN_SESSION or KERN_TMEM (ipc.c)
 void *kern_handle_get(uint32_t h, int kind);
+struct IpcSession;
+struct IpcSession *kern_session_acquire(uint32_t h);        // retained under the handle lock; release after use
 void kern_handle_close(uint32_t h);                        // CloseHandle from the host side, any thread; fatal on a
                                                            // bad handle
 enum { KERN_SESSION = 4, KERN_TMEM = 5 };
@@ -234,6 +236,7 @@ RtStats rt_stats(void);                                    // host_calls: hostfn
 // ---- IPC (ipc.c)
 int ipc_svc(Cpu *c, uint32_t imm);                         // 0x15, 0x1F, 0x21, 0x22; 1 if handled
 void ipc_handle_closed(int kind, void *obj);               // CloseHandle on a KERN_SESSION/KERN_TMEM handle
+void ipc_session_retain(struct IpcSession *session);        // atomic retain; caller owns a ref or holds the handle lock
 
 // ---- file system (romfs.c / fs_host.c)
 void fs_init(void);                                        // idempotent; paths from rt_config()
@@ -298,7 +301,7 @@ void rt_boot(void);                                        // boot.c
 // process exit code.
 int probe_cfg(void);                                       // cfg_probe.c
 int probe_dpi(void);                                       // dpi_probe_win.c (Windows only)
-int probe_loader(void), probe_kernel(void), probe_ipc(void), probe_services(void), probe_fs(void);
+int probe_loader(void), probe_kernel(void), probe_ipc(void), probe_ipc_lifetime(void), probe_services(void), probe_fs(void);
 int probe_gfx_abi(void);                                   // gfx_abi_probe.c
 int probe_vkdevice(void);                                 // vk_device.c
 int probe_nvn(void), probe_nvn_tex(void);                  // nvn_probe.c, nvn_tex_probe.c

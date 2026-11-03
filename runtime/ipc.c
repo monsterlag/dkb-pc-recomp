@@ -45,8 +45,21 @@ uint32_t ipc_session_new(const char *name, IpcHandler handler, void *state, void
 }
 
 static uint32_t session_clone(IpcSession *s) {
-    plat_inc32(&s->refs);
+    ipc_session_retain(s);
     return kern_handle_new(KERN_SESSION, s);
+}
+
+void ipc_session_retain(IpcSession *s) {
+    plat_inc32(&s->refs);
+}
+
+void ipc_session_release(IpcSession *s) {
+    if (plat_dec32(&s->refs)) return;
+    if (rt_trace & RT_TRACE_IPC) rt_log("ipc: %s closed", s->name);
+    if (s->close) s->close(s->state);
+    free(s);
+    plat_dec32(&g_live);
+    plat_inc64(&g_released);
 }
 
 void ipc_handle_closed(int kind, void *obj) {
@@ -55,13 +68,7 @@ void ipc_handle_closed(int kind, void *obj) {
         return;
     }
     if (kind != KERN_SESSION) rt_fatal("ipc_handle_closed: handle kind %d", kind);
-    IpcSession *s = obj;
-    if (plat_dec32(&s->refs)) return;
-    if (rt_trace & RT_TRACE_IPC) rt_log("ipc: %s closed", s->name);
-    if (s->close) s->close(s->state);
-    free(s);
-    plat_dec32(&g_live);
-    plat_inc64(&g_released);
+    ipc_session_release(obj);
 }
 
 // ---- helpers for services
@@ -289,7 +296,7 @@ int ipc_svc(Cpu *c, uint32_t imm) {
     }
     case 0x21: case 0x22: {   // SendSyncRequest(w0 handle) / WithUserBuffer(x0 buffer, x1 size, w2 handle)
         uint32_t h = (uint32_t)(imm == 0x21 ? x[0] : x[2]);
-        IpcSession *s = kern_handle_get(h, KERN_SESSION);
+        IpcSession *s = kern_session_acquire(h);
         if (!s) {
             rt_log("ipc: svc %#x on %#x, not a session handle", imm, h);
             x[0] = IPC_R_BAD_HANDLE;
@@ -302,6 +309,7 @@ int ipc_svc(Cpu *c, uint32_t imm) {
         t_req = c;
         dispatch(s, m);
         t_req = outer;
+        ipc_session_release(s);
         x[0] = 0;
         return 1;
     }
@@ -793,4 +801,112 @@ int probe_ipc(void) {
     }
     printf("probe-ipc: passed\n");
     return 0;
+}
+
+// ---- --probe-ipc-lifetime: no modules or audio device needed
+typedef struct {
+    PlatEvent entered, proceed;
+    Cpu cpu;
+    _Alignas(16) uint32_t message[IPC_MSG_BYTES / 4];
+    uint32_t handle, svc;
+    volatile int32_t closes;
+    int reply_before_close, handled;
+} LifetimeProbe;
+
+static void lifetime_closed(void *state) {
+    LifetimeProbe *p = state;
+    // Re-enter the handle table: a service's close callback must run without the kernel lock held.
+    kern_handle_get(0x0fff, KERN_SESSION);
+    p->reply_before_close = p->message[4] == CMIF_OUT_MAGIC && p->message[6] == 0 &&
+                            p->message[8] == 0xc0decafeu;
+    plat_inc32(&p->closes);
+}
+
+static void lifetime_handler(IpcSession *session, const IpcRequest *rq, IpcResponse *rs) {
+    LifetimeProbe *p = session->state;
+    (void)rq;
+    plat_event_set(&p->entered);
+    plat_event_wait(&p->proceed);
+    // State belongs to the probe until its worker is joined, not to the session's close callback.
+    uint32_t value = 0xc0decafeu;
+    IPC_OUT(rs, value);
+}
+
+static int lifetime_send(Cpu *c, unsigned svc, uint32_t handle, uint32_t *message) {
+    c->tpidrro = (uint64_t)(uintptr_t)message;
+    c->x[0] = svc == 0x21 ? handle : (uint64_t)(uintptr_t)message;
+    c->x[1] = IPC_MSG_BYTES;
+    c->x[2] = handle;
+    return ipc_svc(c, svc);
+}
+
+static void lifetime_request(void *state) {
+    LifetimeProbe *p = state;
+    p->handled = lifetime_send(&p->cpu, p->svc, p->handle, p->message);
+}
+
+int probe_ipc_lifetime(void) {
+    int before = failures;
+    unsigned trace = rt_trace;
+    // The negative control detects premature destruction without following the dangling session in trace output.
+    rt_trace = 0;
+    for (unsigned svc = 0x21; svc <= 0x22; svc++) {
+        LifetimeProbe p = {0};
+        plat_event_init(&p.entered, 1, 0);
+        plat_event_init(&p.proceed, 1, 0);
+        long live = ipc_sessions_live();
+        uint64_t released = ipc_sessions_released();
+        uint32_t original = ipc_session_new("lifetime probe", lifetime_handler, &p, lifetime_closed);
+        Cpu control_cpu = {0};
+        _Alignas(16) uint32_t control_message[IPC_MSG_BYTES / 4];
+        Msg clone = {.type = T_CONTROL, .cmd = svc == 0x21 ? 2 : 4};
+        msg_build(control_message, &clone);
+        int handled = lifetime_send(&control_cpu, svc, original, control_message);
+        Reply reply;
+        msg_parse(control_message, 0, &reply);
+        CHECK(handled && !control_cpu.x[0] && !reply.result && reply.nmove == 1,
+              "svc %#x CloneCurrentObject", svc);
+        if (!reply.nmove) rt_fatal("probe-ipc-lifetime: no cloned handle");
+        p.handle = reply.move[0];
+        p.svc = svc;
+        kern_handle_close(original);
+        CHECK(!plat_cas32(&p.closes, 0, 0), "clone did not retain its session");
+        Msg request = {.type = T_REQUEST, .cmd = 0};
+        msg_build(p.message, &request);
+        PlatThread *worker = plat_thread_new(lifetime_request, &p, "ipc lifetime");
+        if (!worker) rt_fatal("probe-ipc-lifetime: cannot start worker");
+        if (!plat_event_wait_ns(&p.entered, 10000000000ull))
+            rt_fatal("probe-ipc-lifetime: handler did not enter");
+        kern_handle_close(p.handle);
+        CHECK(!plat_cas32(&p.closes, 0, 0) && ipc_sessions_live() == live + 1 &&
+              ipc_sessions_released() == released, "svc %#x last close destroyed an in-flight session", svc);
+        msg_build(control_message, &clone);
+        handled = lifetime_send(&control_cpu, svc, p.handle, control_message);
+        CHECK(handled && control_cpu.x[0] == IPC_R_BAD_HANDLE,
+              "svc %#x accepts a closed handle while its old request remains active", svc);
+        plat_event_set(&p.proceed);
+        if (!plat_thread_join_ns(worker, 10000000000ull))
+            rt_fatal("probe-ipc-lifetime: worker did not finish");
+        msg_parse(p.message, 0, &reply);
+        uint32_t value = 0;
+        if (!reply.result) memcpy(&value, reply.data, sizeof value);
+        CHECK(p.handled && !p.cpu.x[0] && !reply.result && value == 0xc0decafeu,
+              "svc %#x lost its in-flight response", svc);
+        CHECK(plat_cas32(&p.closes, 0, 0) == 1 && p.reply_before_close && ipc_sessions_live() == live &&
+              ipc_sessions_released() == released + 1, "svc %#x final request did not release exactly once after replying", svc);
+
+        // Close-message early returns must also release their temporary request reference.
+        LifetimeProbe close = {0};
+        uint32_t handle = ipc_session_new("close probe", lifetime_handler, &close, lifetime_closed);
+        close.message[0] = svc == 0x21 ? T_CLOSE : T_TIPC_CLOSE;
+        handled = lifetime_send(&close.cpu, svc, handle, close.message);
+        CHECK(handled && !close.cpu.x[0] && !plat_cas32(&close.closes, 0, 0), "svc %#x close message", svc);
+        kern_handle_close(handle);
+        CHECK(plat_cas32(&close.closes, 0, 0) == 1 && ipc_sessions_live() == live &&
+              ipc_sessions_released() == released + 2, "svc %#x close message leaked a reference", svc);
+        printf("ipc lifetime: svc %#x last-close, clone, invalid handle and close-message checks complete\n", svc);
+    }
+    rt_trace = trace;
+    printf("probe-ipc-lifetime: %s (%d failures)\n", failures == before ? "passed" : "FAILED", failures - before);
+    return failures != before;
 }
