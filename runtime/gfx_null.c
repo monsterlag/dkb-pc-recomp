@@ -69,6 +69,7 @@ static void null_replay(uint64_t handle) {
         const void *a = nvn_op_payload(h);
         switch (h->op) {
         case OP_END: return;
+        case OP_WAIT_SYNC: break;   // fulfilled by submit preparation; never reread its source here
         case OP_SIGNAL_EVENT: {
             const p_signal_event *e = a;
             if (e->mode == NVN_EVENT_SIGNAL_MODE_ADD) __atomic_fetch_add(e->val, e->value, __ATOMIC_RELEASE);

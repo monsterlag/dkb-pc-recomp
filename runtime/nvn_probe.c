@@ -461,6 +461,7 @@ static uint64_t record_all(void) {
     REC(OP_CLEAR_BUF, CALL(nvnCommandBufferReportValue, U(c), 0x1234, 0xc300));
     static const uint32_t pushed[4] = {0x39b60b61, 0x3a21d13a, 0x45340000, 0x44ca8000};   // 1/2880, 1/1620, 2880, 1620
     REC(OP_PUSH_CONST, CALL(nvnCommandBufferPushGraphicsConstants, U(c), 0, 0x10, sizeof pushed, U(pushed)));
+    REC(OP_WAIT_SYNC, CALL(nvnCommandBufferWaitSync, U(c), U(&syncs)));
     CALL(nvnCommandBufferPushComputeConstants, U(c), 0, 0, 2, U(pushed));   // under 4 bytes: dropped, as the driver does
     static const int thresholds[4] = {1, 2, 3, 4};
     CALL(nvnCommandBufferSetColorReductionEnable, U(c), 1);   // hints: nothing recorded
@@ -692,6 +693,8 @@ static void parse_all(uint64_t h) {
                       p->w[3] == 0x44ca8000, "PUSH_CONST payload");
             break;
         }
+        case OP_WAIT_SYNC: CHECK(((const p_wait_sync *)a)->sync == (const sync_t *)(const void *)&syncs,
+                                 "WAIT_SYNC retains the submit-time source pointer"); break;
         default: CHECK(0, "unexpected op %s", nvn_op_name(o->op)); break;
         }
     }

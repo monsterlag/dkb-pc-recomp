@@ -83,6 +83,9 @@ typedef struct { uint64_t type; } p_reset_counter;         // OP_RESET_COUNTER
 typedef struct { uint64_t src, dst, size; } p_copy_b2b;    // OP_COPY_B2B: GPU addresses
 typedef struct { uint64_t dst, size; uint8_t data[]; } p_update_ub;   // OP_UPDATE_UB: size bytes written at dst
 typedef struct { int32_t bits, pad; } p_barrier;           // OP_BARRIER: NVNbarrierBits
+// OP_WAIT_SYNC retains the source until submit preparation, as the SDK's control record does. The caller keeps
+// the sync alive through each submit; the backend never dereferences it after preparation returns.
+typedef struct { const sync_t *sync; } p_wait_sync;
 typedef struct { uint64_t target; } p_jump;                // OP_JUMP / OP_CALL: next record / called recording
 // OP_DRAW_IDX_IND: DrawElementsIndirect; ind = GPU address of {count, instances, first index, base vertex, base
 // instance} (VkDrawIndexedIndirectCommand's layout), read by the GPU when the draw runs

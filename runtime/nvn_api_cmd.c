@@ -890,13 +890,18 @@ NVN_API(nvnCommandBufferSetCopyRowStride) { REC(cmd_of(c), OP_COPY_STRIDE, p_cop
 // void nvnCommandBufferSetBlendColor(NVNcommandBuffer *cmd, const float *rgba)
 NVN_API(nvnCommandBufferSetBlendColor) { memcpy(REC(cmd_of(c), OP_BLEND_COLOR, p_blend_color)->rgba, arg_p(c, 1), 16); }
 
-// Commands without an effect on this replay (hle_nvn.c g_nops): WaitSync and WaitEvent order work against other queues
-// or the CPU, and every submit replays in order on one queue; shader scratch memory and the tessellation patch size
-// have no host counterpart the replay needs.
-// void nvnCommandBufferWaitSync(NVNcommandBuffer *cmd, const NVNsync *sync), WaitEvent(cmd, const NVNevent *event,
+// void nvnCommandBufferWaitSync(NVNcommandBuffer *cmd, const NVNsync *sync): the SDK retains the pointer at record
+// time and reads the sync's current producer at submit. Preparation fulfils the wait before consumer CPU snapshots.
+NVN_API(nvnCommandBufferWaitSync) {
+    cmd_t *o = cmd_of(c);
+    REC(o, OP_WAIT_SYNC, p_wait_sync)->sync = arg_p(c, 1);
+    hw_fix(o, 0);   // the SDK records a CPU control entry here; GPU wait commands are emitted at submit
+}
+// Commands without an effect on this replay (hle_nvn.c g_nops). WaitEvent still relies on in-order replay; shader
+// scratch memory and the tessellation patch size have no host counterpart the replay needs.
+// void nvnCommandBufferWaitEvent(cmd, const NVNevent *event,
 // NVNeventWaitMode mode, uint32_t value), SetShaderScratchMemory(cmd, const NVNmemoryPool *pool, ptrdiff_t offset,
 // size_t size), SetPatchSize(cmd, int size)
-NVN_API(nvnCommandBufferWaitSync) { (void)c; }
 NVN_API(nvnCommandBufferWaitEvent) { (void)c; }
 NVN_API(nvnCommandBufferSetShaderScratchMemory) { (void)c; }
 NVN_API(nvnCommandBufferSetPatchSize) { (void)c; }
@@ -906,6 +911,61 @@ NVN_API(nvnCommandBufferSetPatchSize) { (void)c; }
 // and deferred binds and pushes take the data the game's arrays hold now (the game fills its tables for the next frame
 // as soon as the submit returns). The result is written into the recording copy.
 static uint64_t def_reads, def_changed, n_clones;
+
+// Only QueueFenceSync and window acquire currently produce syncs: both name work outside this submission that is
+// already queued (or complete). Recorded FenceSync and imported/external producers remain unimplemented.
+// Waiting for their maximum before the whole batch is conservative: it orders CPU completion callbacks as well
+// as GPU work before *any* deferred read or backend snapshot, including those before a wait in another handle.
+static uint64_t wait_target(const uint8_t *p, int depth) {
+    uint64_t target = 0;
+    for (;;) {
+        op_hdr h;
+        memcpy(&h, p, sizeof h);
+        if (h.size < 8 || (h.size & 7) || h.op >= OP_COUNT_)
+            rt_fatal("nvn: corrupt recording at %p while preparing WaitSync (op %u size %u)", (const void *)p, h.op, h.size);
+        if (h.op == OP_END) return target;
+        if (h.op == OP_JUMP) {
+            if (h.size < 16) rt_fatal("nvn: short WaitSync jump record at %p", (const void *)p);
+            memcpy(&p, p + 8, 8);
+            continue;
+        }
+        uint64_t value = 0;
+        if (h.op == OP_CALL) {
+            if (h.size < 16) rt_fatal("nvn: short WaitSync call record at %p", (const void *)p);
+            uint64_t called;
+            memcpy(&called, p + 8, 8);
+            if (depth >= 16) rt_fatal("nvn: WaitSync preparation: call depth over 16");
+            value = wait_target((const uint8_t *)(uintptr_t)called, depth + 1);
+        } else if (h.op == OP_WAIT_SYNC) {
+            if (h.size < 8 + sizeof(p_wait_sync)) rt_fatal("nvn: short WaitSync record at %p", (const void *)p);
+            const sync_t *source = ((const p_wait_sync *)(const void *)(p + 8))->sync;
+            if (!source) rt_fatal("nvn: CommandBufferWaitSync with a null sync");
+            sync_t snapshot;
+            memcpy(&snapshot, source, sizeof snapshot);   // one value-at-submit read; never reread while waiting
+            if (snapshot.magic != MAGIC('S', 'Y', 'N', 'C') ||
+                (snapshot.fenced != 0 && snapshot.fenced != 1 && snapshot.fenced != 3))
+                rt_fatal("nvn: CommandBufferWaitSync with an invalid sync state");
+            if (snapshot.fenced) value = snapshot.fence;   // an unfenced SDK sync emits no GPU wait
+        }
+        if (value > target) target = value;
+        p += h.size;
+    }
+}
+
+static void wait_submission(const uint64_t *handles, int n) {
+    uint64_t target = 0;
+    for (int i = 0; i < n; i++) {
+        uint64_t value = wait_target((const uint8_t *)(uintptr_t)handles[i], 0);
+        if (value > target) target = value;
+    }
+    if (!target) return;
+    const GfxBackend *b = gfx_backend();
+    // No copy/backend lock is held here. QueueSubmitCommands has given its virtual core up. The async front
+    // submit lock does not stop an already-enqueued producer: replay/completion never acquire that lock.
+    // fence_done/fence_wait include completion callbacks, unlike the raw Vulkan timeline.
+    if (b->fence_done() < target && !b->fence_wait(target, UINT64_MAX))
+        rt_fatal("nvn: CommandBufferWaitSync could not reach producer fence %llu", (unsigned long long)target);
+}
 
 static int resolve_deferred(const uint8_t *p, int depth) {   // returns the number of deferred binds and pushes
     int nd = 0;
@@ -957,6 +1017,7 @@ static int resolve_deferred(const uint8_t *p, int depth) {   // returns the numb
 void nvn_submit_prepare(const uint64_t *handles, int n) {
     uint64_t now = __atomic_add_fetch(&nsubmits, 1, __ATOMIC_RELAXED);
     for (int i = 0; i < n; i++) copy_touch(handles[i], now, "QueueSubmitCommands");
+    wait_submission(handles, n);
     for (int i = 0; i < n; i++) resolve_deferred((const uint8_t *)(uintptr_t)handles[i], 0);
 }
 
@@ -990,6 +1051,7 @@ void nvn_submit_prepare_async(const uint64_t *handles, uint64_t *out, int n) {
         }
     }
     plat_mutex_unlock(&copy_lock);
+    wait_submission(out, n);
     for (int i = 0; i < n; i++) {
         int nd = resolve_deferred((const uint8_t *)(uintptr_t)out[i], 0);
         if (out[i] == handles[i]) ((copy_prefix *)(uintptr_t)out[i] - 1)->deferred = nd ? 2 : 1;
@@ -1008,7 +1070,7 @@ const char *nvn_op_name(uint32_t op) {
         "BIND_VSTREAM", "BIND_VBUF", "BIND_UBO", "BIND_SSBO", "BIND_TEX", "BIND_SAMP", "STENCIL", "POLY_OFFSET", "DRAW",
         "DRAW_IDX", "DISPATCH", "BARRIER", "SET_TEX_POOL", "SET_SAMP_POOL", "COPY_B2T", "COPY_STRIDE", "BLEND_COLOR",
         "COPY_T2B", "BIND_IMG", "COPY_T2T", "RESET_COUNTER", "CLEAR_TEX", "DEPTH_CLAMP", "RENDER_ENABLE",
-        "RASTER_DISCARD", "RENDER_COND", "PRIM_RESTART", "DRAW_IDX_IND", "DISPATCH_IND", "CLEAR_BUF", "PUSH_CONST",
+        "RASTER_DISCARD", "RENDER_COND", "PRIM_RESTART", "DRAW_IDX_IND", "DISPATCH_IND", "CLEAR_BUF", "PUSH_CONST", "WAIT_SYNC",
     };
     _Static_assert(sizeof names / sizeof *names == OP_COUNT_, "one name per op");
     return op < OP_COUNT_ ? names[op] : "?";

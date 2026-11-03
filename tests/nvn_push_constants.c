@@ -46,6 +46,7 @@ void plat_mutex_unlock(PlatMutex *m) { (void)m; }
 void plat_mutex_lock_shared(PlatMutex *m) { (void)m; }
 void plat_mutex_unlock_shared(PlatMutex *m) { (void)m; }
 uint64_t gfx_replayed_submits(void) { return replayed; }
+const GfxBackend *gfx_backend(void) { rt_fatal("unexpected sync wait in push-constant fixture"); return NULL; }
 void rt_log(const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
