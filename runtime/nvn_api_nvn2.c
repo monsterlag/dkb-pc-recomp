@@ -53,6 +53,12 @@ NVN_API(nvnWindowBuilderSetHdrContentMetadata) { (void)c; }
 NVN_API(nvnWindowSetHdrDisplayMetadata) { (void)c; }
 NVN_API(nvnWindowSetHdrContentMetadata) { (void)c; }
 
+// void nvnCommandBufferSetComputeOverlapMode(NVNcommandBuffer *cmd, uint32_t mode)
+// NVN 2 changes compute/graphics scheduling, not shader or resource state (docs/nvn2-command-modes.md).
+// Our dispatch and graphics-pass boundaries already insert full barriers on one queue, so both scheduling modes
+// retain that conservative ordering. Allowing overlap does not require the host to execute work concurrently.
+NVN_API(nvnCommandBufferSetComputeOverlapMode) { (void)c; }
+
 // ---- Command buffer calls new in NVN 2. Until the Vulkan back end learns them (mesh shaders, ray tracing, DLSS,
 // variable-rate shading, conditional enables, device command buffers), they are accepted and
 // recorded nowhere, and the first call of each is logged, so a run lists what the back end still has to do. None of
@@ -105,7 +111,6 @@ NVN2_NOT_RECORDED(nvnCommandBufferPopDebugGroupGraphics)
 // nvnCommandBufferPush{Graphics,Compute}Constants and their Deferred forms are recorded in nvn_api_cmd.c (OP_PUSH_CONST).
 NVN2_NOT_RECORDED(nvnCommandBufferSetComputeEnable)
 NVN2_NOT_RECORDED(nvnCommandBufferSetComputeEnableConditional)
-NVN2_NOT_RECORDED(nvnCommandBufferSetComputeOverlapMode)
 NVN2_NOT_RECORDED(nvnCommandBufferSetCopyEnable)
 NVN2_NOT_RECORDED(nvnCommandBufferSetCopyEnableConditional)
 NVN2_NOT_RECORDED(nvnCommandBufferSetConservativeRasterMode)
