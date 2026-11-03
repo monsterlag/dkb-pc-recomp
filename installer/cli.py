@@ -1,4 +1,6 @@
-"""Command line: python -m installer --base FILE --update FILE --keys FILE --lang CODE --dest DIR [--root DIR]
+"""Command line: python -m installer --exefs DIR --romfs DIR --dest DIR [--package DIR] (Bananza base 1.0.0)
+
+Legacy TotK: --base FILE --update FILE --keys FILE --lang CODE --dest DIR [--root DIR]
                                      [--temp DIR] [--verify]
 
 A first install needs every option. On a folder with totk-install.json (resume after a cancel or failure, or update
@@ -17,7 +19,6 @@ from . import layout as layouts
 from . import state as statefile
 from .events import Reporter
 from .runner import Context, run_steps
-from .steps import all_steps
 
 EXIT = {'ok': 0, 'failed': 1, 'cancelled': 3}
 
@@ -54,7 +55,27 @@ def main(argv=None):
     ap.add_argument('--temp', type=Path, help='temp folder (default: temp/ of the release on Windows, .setup-temp in '
                                               'the install folder on Linux, build/install-temp in a repository)')
     ap.add_argument('--verify', action='store_true', help='hash every kept file, also those this release made')
+    ap.add_argument('--game', choices=('bananza', 'totk'), help='game profile (folder inputs select Bananza)')
+    ap.add_argument('--exefs', type=Path, help='Bananza base 1.0.0 ExeFS folder')
+    ap.add_argument('--romfs', type=Path, help='Bananza loose RomFS folder or packed romfs.bin/index.json folder')
+    ap.add_argument('--package', type=Path, help='tool package with llvm/, runtime/deps/ and bin/')
+    ap.add_argument('--toolchain', type=Path, help='LLVM toolchain directory')
+    ap.add_argument('--deps', type=Path, help='build dependency directory with include/ and lib/')
+    ap.add_argument('--ninja', type=Path, help='Ninja executable')
+    ap.add_argument('--dll-dir', type=Path, help='runtime DLL directory (Windows)')
+    ap.add_argument('--translator', type=Path, help='prebuilt translator, with matching .id beside it')
+    ap.add_argument('--dotnet', type=Path, help='portable .NET 10 dotnet executable, when building the translator')
+    ap.add_argument('--jobs', type=int, default=6, help='Bananza worker limit (default 6)')
     args = ap.parse_args(argv)
+
+    if (args.game == 'bananza' or args.exefs or args.romfs or
+            (args.game is None and (args.dest / 'dkb-install.json').is_file())):
+        if args.game == 'totk':
+            ap.error('--exefs/--romfs require --game bananza')
+        from .bananza import main as bananza_main
+        return bananza_main(args)
+
+    from .steps import all_steps   # legacy extraction needs Python 3.14; folder installs do not import it
 
     # The window cancels with Ctrl+Break to the installer's process group (CREATE_NEW_PROCESS_GROUP), which also reaches
     # the tools it runs; Python's default for it ends the process without recording anything.

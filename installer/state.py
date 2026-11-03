@@ -27,9 +27,9 @@ def empty(release):
     return {'format': FORMAT, 'release': release, 'inputs': {}, 'steps': {}}
 
 
-def load(dest):
+def load(dest, name=NAME):
     """The state of dest, or None when the folder has none. StateError for an unreadable or newer file."""
-    path = Path(dest) / NAME
+    path = Path(dest) / name
     if not path.is_file():
         return None
     try:
@@ -43,9 +43,9 @@ def load(dest):
     return data
 
 
-def save(dest, data):
-    path = Path(dest) / NAME
-    tmp = path.with_name(NAME + '.tmp')
+def save(dest, data, name=NAME):
+    path = Path(dest) / name
+    tmp = path.with_name(name + '.tmp')
     with open(tmp, 'w', encoding='utf-8', newline='\n') as f:
         json.dump(data, f, indent=1, ensure_ascii=False)
         f.write('\n')

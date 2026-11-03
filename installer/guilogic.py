@@ -26,6 +26,7 @@ from .events import render
 TEXT = Path(__file__).resolve().parent / 'text'
 UI_LANGUAGES = ('en', 'ru')
 STEP_ORDER = ('check', 'extract', 'lift', 'compile', 'prepare', 'cleanup')
+DKB_STEP_ORDER = ('check', 'dkb_data', 'dkb_translator', 'lift', 'compile', 'dkb_verify', 'cleanup')
 # message parameter -> catalog id prefix of the names that replace its raw values
 PARAM_NAMES = {'lang': 'lang.', 'known': 'lang.', 'step': 'step.', 'input': 'param.input.'}
 LANG_RU = 0x19   # primary language id of Russian in a Windows LANGID
@@ -39,7 +40,8 @@ def load_texts(lang):
 class Catalog:
     """Window text: ids from text/<lang>.json, then text/en.json, then the id itself."""
 
-    def __init__(self, lang='en'):
+    def __init__(self, lang='en', game='totk'):
+        self.game = game
         self.english = load_texts('en')
         self.set_language(lang)
 
@@ -51,10 +53,15 @@ class Catalog:
         return id in self.texts or id in self.english
 
     def __call__(self, id, **params):
+        if self.game == 'bananza' and self.has('dkb.' + id):
+            id = 'dkb.' + id
         text = self.texts.get(id) or self.english.get(id)
         if text is None:
             return id
-        return render({id: text}, id, {k: self.param(k, v) for k, v in params.items()})
+        values = {k: self.param(k, v) for k, v in params.items()}
+        if self.game == 'bananza':
+            values['game_exe'] = 'dkb.exe' if os.name == 'nt' else 'dkb'
+        return render({id: text}, id, values)
 
     def param(self, name, value):
         """A message parameter as the player should read it: language codes, step ids and input names become the
@@ -113,13 +120,17 @@ class Form:
     keys: str = ''
     lang: str = ''
     dest: str = ''
+    game: str = 'totk'
+    exefs: str = ''
+    romfs: str = ''
+    package: str = ''
 
     def installed_state(self):
         """The recorded state of the install folder (totk-install.json), or None. Never raises."""
         if not self.dest.strip():
             return None
         try:
-            return statefile.load(Path(self.dest.strip()))
+            return statefile.load(Path(self.dest.strip()), 'dkb-install.json' if self.game == 'bananza' else statefile.NAME)
         except statefile.StateError:
             return None
 
@@ -133,6 +144,16 @@ class Form:
         update = self.update_mode()
         if not self.dest.strip():
             found.append('ui.need_dest')
+        if self.game == 'bananza':
+            for name in ('exefs', 'romfs'):
+                value = getattr(self, name).strip()
+                if not value and not update:
+                    found.append('dkb.need_' + name)
+                elif value and not Path(value).is_dir():
+                    found.append('dkb.need_' + name)
+            if self.package.strip() and not Path(self.package.strip()).is_dir():
+                found.append('dkb.need_package')
+            return found
         if not update:
             for name in ('base', 'update', 'keys'):
                 value = getattr(self, name).strip()
@@ -149,10 +170,15 @@ class Form:
                     found.append(f'ui.missing_{name}')
         return found
 
-    def command(self, python, root=None, temp=None, verify=False):
+    def command(self, python, root=None, temp=None, verify=False, tools=None):
         cmd = [str(python), '-m', 'installer']
-        for flag, value in (('--base', self.base), ('--update', self.update), ('--keys', self.keys),
-                            ('--lang', self.lang), ('--dest', self.dest)):
+        fields = (('--base', self.base), ('--update', self.update), ('--keys', self.keys),
+                  ('--lang', self.lang), ('--dest', self.dest))
+        if self.game == 'bananza':
+            cmd += ['--game', 'bananza']
+            fields = (('--exefs', self.exefs), ('--romfs', self.romfs), ('--package', self.package),
+                      ('--lang', self.lang), ('--dest', self.dest))
+        for flag, value in fields:
             if value.strip():
                 cmd += [flag, value.strip()]
         if root:
@@ -161,6 +187,10 @@ class Form:
             cmd += ['--temp', str(temp)]
         if verify:
             cmd.append('--verify')
+        if self.game == 'bananza':
+            for flag, value in (tools or {}).items():
+                if value is not None:
+                    cmd += ['--' + flag.replace('_', '-'), str(value)]
         return cmd
 
 
@@ -184,8 +214,8 @@ def parse_line(line):
 class Model:
     """What the window shows, folded from events. apply() takes one event; nothing else mutates it."""
 
-    def __init__(self):
-        self.steps = list(STEP_ORDER)
+    def __init__(self, steps=None):
+        self.steps = list(steps or STEP_ORDER)
         self.states = {s: PENDING for s in self.steps}
         self.mode = ''
         self.release = ''

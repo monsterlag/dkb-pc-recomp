@@ -1,8 +1,91 @@
 # Installer
 
-> [!NOTE]
-> This page comes from TotK Recomp and describes its installer for *Tears of the Kingdom*. DKB Recomp has no installer
-> yet: bringing this one to Bananza is [#8](https://github.com/Lucas-blip-png/dkb-pc-recomp/issues/8).
+## Bananza base 1.0.0
+
+The folder installer accepts an already dumped base 1.0.0 ExeFS (`main`, `sdk`, `rtld`, `main.npdm`) and either a
+loose RomFS folder or a folder containing `romfs.bin` and `index.json`. No keys or update are requested. An update
+ExeFS fails the pinned SHA-256 checks in `tools/data/expected-dkb100.json` before the installer creates output or logs.
+
+Run from this checkout with Python 3.12 or later, with the generator's dependencies (`tools/requirements.txt`). The
+window also needs tkinter. The source checkout must contain the full runtime; the older TotK prebuilt runtime
+library cannot build Bananza. A Windows tool package supplies:
+
+```
+<tools>/llvm/bin/clang.exe, llvm-ar.exe, llvm-windres.exe
+<tools>/runtime/deps/include/, lib/       Vulkan, VMA, SDL3, Opus, libvpx and zstd dependencies
+<tools>/bin/ninja.exe, SDL3.dll, libopus-0.dll
+```
+
+The package contains tools only, and may be kept separately from this checkout. No machine-specific path is built
+into the installer. `--toolchain`, `--deps`, `--ninja` and `--dll-dir` override individual paths. Without `--package`,
+the installer checks this checkout's existing toolchain layout. It never installs tools globally.
+
+```
+python -m installer --game bananza --exefs "<dump>/base/exefs" --romfs "<dump>/base/romfs" --dest "<install folder>" --package "<tools>" --jobs 6
+```
+
+The shader translator is reused when its `.id` matches the current translator sources. Pass `--translator
+<path>/totk_xlate.exe` to choose a prebuilt translator, keeping `totk_xlate.id` beside it. Otherwise the installer
+builds it with `tools/build_xlate.py` in its owned temporary folder. That path needs the .NET 10 SDK and, on Windows,
+the Visual Studio C++ build tools and Windows SDK for NativeAOT. `--dotnet <portable-sdk>/dotnet.exe` selects a local
+SDK; the checkout's `toolchain/dotnet` and PATH are also checked. These settings affect child processes only.
+
+The native window uses the same CLI, steps and cancellation mechanism:
+
+```
+python -m installer.gui --package "<tools>"
+```
+
+Its pickers select ExeFS, RomFS, the optional tool package, language and destination. The individual tool overrides,
+including `--translator` and `--dotnet`, also work on this command. `--game totk` selects the inherited TotK window.
+
+The Bananza steps are:
+
+1. Hash the supported ExeFS and all loose RomFS input files, reject overlapping or linked input/output paths,
+   validate the tool paths and translator identity, then check disk space, AVX2 and Vulkan 1.3.
+2. Stage ExeFS and run `tools/dkb_pack_romfs.py` for loose input. Read the packed image back, check its image checksum
+   and every file against the initial content snapshot, then copy verified files into the destination. A prepacked
+   input's checksum and bounds are checked too. This verifies packing integrity; a loose dump has no NCA hash tree
+   to authenticate its original contents.
+3. Prepare the matching shader translator.
+4. Generate `main,sdk` into the temporary folder with the required `recomp/patches-dkb100.txt`. Missing applied patches
+   stop the build. `subsdk0` is not generated.
+5. Build `dkb100` from the current runtime sources with `tools/build_game.py`, without `--runtime-lib`, then copy the
+   executable, runtime libraries and RomFS index into place. The default worker limit is six; `--jobs` changes it.
+6. Write the selected language while preserving existing settings, run the installed executable's `--selftest`, and
+   remove only owned staging/build directories. Logs remain in the temporary folder. Setup does not start the game.
+
+The portable output contains `dkb.exe`, its runtime DLLs, `totk_xlate.exe` and `.id`, `exefs/`, packed `romfs/`,
+`romfs-index.bin`, `totk.ini` and `dkb-install.json`. The inherited `totk.ini` name is intentional: the runtime reads
+it. Saves and shader caches are created beside the executable when it runs. Source dumps stay untouched.
+
+Only an empty destination or a Bananza install with matching ownership metadata is accepted. Temporary work has its
+own ownership marker; an unrelated nonempty temporary directory is refused. OS-held locks prevent simultaneous
+setups from writing the same destination or workspace and are released after process exit, including a crash.
+Cancellation stops the installer's child process tree, leaves completed steps recorded atomically, and never deletes
+source files, saves or other user settings. Partial files are not recorded as completed steps.
+
+Resume with the same command, or `python -m installer --game bananza --dest "<install folder>"`. Recorded source and
+tool paths are reused, input contents are fingerprinted again, and intact completed steps are skipped. Keep the source
+folders available until setup completes. `--verify` also hashes kept output. Changed input, generator, required patch
+table, runtime, dependencies or translator identity invalidates the corresponding steps. `--temp` selects a workspace
+base; it is kept separate from the destination and sources. Re-running setup preserves `profile/`.
+
+CLI exit codes and JSON events are the same as below. Lightweight checks, with no game files:
+
+```
+python tests/installer_bananza_test.py
+python -m installer.gui --game bananza --selftest
+```
+
+A full generation/build and a title-screen run from the finished folder are separate end-to-end checks. Synthetic
+installer tests do not establish game compatibility. No completed install, game-derived output or cache belongs in a
+release or pull request. Release assembly in `tools/make_release*.py` still describes the inherited TotK package; a
+Bananza release must include the complete runtime source/dependencies rather than its old runtime archive.
+
+## Inherited TotK installer
+
+The remainder documents the preserved TotK container workflow (`--game totk`).
 
 A public release that turns the player's own game files into a playable TotK folder. The release carries no game
 data and no code derived from the game: the installer builds the game on the player's machine. The installed folder

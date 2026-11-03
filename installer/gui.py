@@ -23,7 +23,7 @@ except ImportError:
 
 from . import ini
 from . import layout as layouts
-from .guilogic import (DONE, FAILED, PENDING, RUNNING, SKIPPED, UI_LANGUAGES, Catalog, Form, Model, Process,
+from .guilogic import (DKB_STEP_ORDER, DONE, FAILED, PENDING, RUNNING, SKIPPED, UI_LANGUAGES, Catalog, Form, Model, Process,
                        amount, default_game_language, describe_event, parse_line, windows_ui_language)
 
 POLL_MS = 100
@@ -41,17 +41,30 @@ def fix_tcl_paths():
                 os.environ[var] = str(tcl / lib)
 
 
+def fix_dpi_awareness():
+    """Use physical window coordinates before Tk starts, so its geometry agrees with screenshot coordinates."""
+    if os.name != 'nt':
+        return
+    import ctypes
+    set_context = getattr(ctypes.windll.user32, 'SetProcessDpiAwarenessContext', None)
+    if set_context:
+        set_context.argtypes = [ctypes.c_void_p]
+        set_context.restype = ctypes.c_int
+        set_context(ctypes.c_void_p(-4))   # PER_MONITOR_AWARE_V2; an already configured process keeps its context
+
+
 class App:
-    def __init__(self, root, ui_lang, layout, run_args=None):
+    def __init__(self, root, ui_lang, layout, run_args=None, game='totk'):
         self.root, self.layout = root, layout
-        self.cat = Catalog(ui_lang)
-        self.model = Model()
+        self.game = game
+        self.cat = Catalog(ui_lang, game)
+        self.model = Model(DKB_STEP_ORDER if game == 'bananza' else None)
         self.process = None
         self.closing = False
         self.run_args = run_args or {}   # extra CLI options for tests: temp, verify
         self.log_entries = []            # events and raw lines of the run, rendered by render_log
         self.bound = []                  # (widget, option, id, params) retranslated on a language switch
-        self.vars = {n: tk.StringVar() for n in ('base', 'update', 'keys', 'dest')}
+        self.vars = {n: tk.StringVar() for n in ('base', 'update', 'keys', 'exefs', 'romfs', 'package', 'dest')}
         self.vars['lang'] = tk.StringVar()
         self.lang_code = default_game_language(ui_lang)
         self.screen = None
@@ -188,6 +201,9 @@ class App:
         grid.columnconfigure(1, weight=1)
         rows = (('base', 'ui.base', 'ui.pick_game'), ('update', 'ui.update', 'ui.pick_update'),
                 ('keys', 'ui.keys', 'ui.pick_keys'))
+        if self.game == 'bananza':
+            rows = (('exefs', 'dkb.ui.exefs', 'dkb.ui.pick_exefs'), ('romfs', 'dkb.ui.romfs', 'dkb.ui.pick_romfs'),
+                    ('package', 'dkb.ui.package', 'dkb.ui.pick_package'))
         self.form_rows = {}
         for i, (name, label_id, pick_id) in enumerate(rows):
             lab = self.label(grid, label_id)
@@ -210,7 +226,8 @@ class App:
         self.update_hint.pack(anchor='w', pady=(8, 0))
         self.form_error = ttk.Label(f, style='Err.TLabel', wraplength=620, justify='left')
         self.form_error.pack(anchor='w', pady=(8, 0))
-        self.label(f, 'ui.keys_private', wraplength=620, justify='left').pack(anchor='w', pady=(8, 0))
+        if self.game != 'bananza':
+            self.label(f, 'ui.keys_private', wraplength=620, justify='left').pack(anchor='w', pady=(8, 0))
         return f
 
     def build_run(self):
@@ -266,7 +283,8 @@ class App:
 
     def form(self):
         return Form(base=self.vars['base'].get(), update=self.vars['update'].get(), keys=self.vars['keys'].get(),
-                    lang=self.selected_lang(), dest=self.vars['dest'].get())
+                    lang=self.selected_lang(), dest=self.vars['dest'].get(), game=self.game,
+                    exefs=self.vars['exefs'].get(), romfs=self.vars['romfs'].get(), package=self.vars['package'].get())
 
     def refresh_form(self):
         form = self.form()
@@ -281,6 +299,11 @@ class App:
         self.fit()
 
     def pick_file(self, name, pick_id):
+        if self.game == 'bananza':
+            path = filedialog.askdirectory(title=self.cat(pick_id), mustexist=True)
+            if path:
+                self.vars[name].set(os.path.normpath(path))
+            return
         types = [(self.cat('ui.type_game'), '*.nsp *.xci'), (self.cat('ui.type_all'), '*.*')]
         if name == 'update':
             types = [(self.cat('ui.type_nsp'), '*.nsp'), (self.cat('ui.type_all'), '*.*')]
@@ -306,11 +329,12 @@ class App:
             return
         self.form_error.configure(text='')
         command = form.command(self.layout.python, root=self.layout.root if self.layout.dev else None,
-                               temp=self.run_args.get('temp'), verify=self.run_args.get('verify', False))
+                               temp=self.run_args.get('temp'), verify=self.run_args.get('verify', False),
+                               tools=self.run_args.get('tools'))
         self.begin(command, self.layout.root)
 
     def begin(self, command, cwd):
-        self.model = Model()
+        self.model = Model(DKB_STEP_ORDER if self.game == 'bananza' else None)
         self.model.dest = self.vars['dest'].get().strip()
         self.clear_log()
         self.build_step_rows(self.model.steps)
@@ -533,13 +557,15 @@ def grab(root, path):
     ImageGrab.grab(bbox=(x, y, x + w, y + h), all_screens=True).save(path)
 
 
-def selftest(layout, shots=None):
+def selftest(layout, shots=None, game='totk'):
     """Every screen in both languages; the window closes itself. Returns 0 when nothing raised."""
     fix_tcl_paths()
+    fix_dpi_awareness()
     root = tk.Tk()
     root.geometry('+60+40')
-    app = App(root, 'en', layout)
+    app = App(root, 'en', layout, game=game)
     steps, mixed = [], []
+    destination = 'Z:/selftest/Bananza' if game == 'bananza' else 'Z:/selftest/TotK'
 
     def shot(name):
         root.update()
@@ -552,10 +578,13 @@ def selftest(layout, shots=None):
             app.ui_var.set(lang)
             app.switch_language()
             tag = lang
-            app.vars['dest'].set('Z:/selftest/TotK')
+            app.vars['dest'].set(destination)
             app.vars['base'].set('Z:/selftest/totk.xci')
             app.vars['update'].set('Z:/selftest/totk-1.2.1.nsp')
             app.vars['keys'].set('Z:/selftest/prod.keys')
+            if game == 'bananza':
+                app.vars['exefs'].set('Z:/selftest/Bananza/exefs')
+                app.vars['romfs'].set('Z:/selftest/Bananza/romfs')
             app.show('form')
             app.start()   # missing files: shows the problems
             steps.append(app.form_error.cget('text'))
@@ -564,7 +593,7 @@ def selftest(layout, shots=None):
             app.clear_log()
             app.build_step_rows(app.model.steps)
             app.show('run')
-            for e in SAMPLE_RUN:
+            for e in samples(SAMPLE_RUN, game):
                 app.feed(json.dumps(e))
             app.log_open = False
             app.toggle_log()
@@ -574,26 +603,28 @@ def selftest(layout, shots=None):
                 app.ui_var.set('ru')
                 app.switch_language()
                 text = app.log.get('1.0', 'end')
-                mixed.append('Checking' in text or 'Extracting' not in text and 'Распаковка' not in text)
+                mixed.append('Checking' in text or (game == 'totk' and 'Extracting' not in text and 'Распаковка' not in text))
                 app.ui_var.set('en')
                 app.switch_language()
             app.model = Model()
-            for e in SAMPLE_OK:
+            for e in samples(SAMPLE_OK, game):
                 app.model.apply(e)
-            app.model.dest = 'Z:/selftest/TotK'
+            app.model.dest = destination
             app.model.finish(0)
             app.refresh_finish()
             app.show('finish')
             shot(f'finish-ok-{tag}')
             app.model = Model()
-            for e in SAMPLE_RUN[:3] + [{'type': 'error', 'id': 'check.disk_space', 'step': 'check',
-                                        'params': {'path': 'Z:/selftest/TotK', 'need_gb': 36.4, 'free_gb': 20.1}},
+            for e in samples(SAMPLE_RUN[:3], game) + [{'type': 'error', 'id': 'check.disk_space', 'step': 'check',
+                                        'params': {'path': destination, 'need_gb': 36.4, 'free_gb': 20.1}},
                                        {'type': 'end', 'result': 'failed', 'seconds': 3}]:
                 app.model.apply(e)
             app.model.finish(1)
             app.refresh_finish()
             shot(f'finish-failed-{tag}')
             app.model = Model()
+            for e in samples(SAMPLE_RUN[:3], game):
+                app.model.apply(e)
             app.model.finish(3)
             app.refresh_finish()
             shot(f'finish-cancelled-{tag}')
@@ -606,19 +637,59 @@ def selftest(layout, shots=None):
     return 0 if len(steps) == len(UI_LANGUAGES) and all(steps) and mixed == [False] else 1
 
 
+def samples(events, game):
+    """Keep the same screen fixtures for both profiles, with each profile's actual step names."""
+    if game != 'bananza':
+        return events
+    mapping = {'extract': 'dkb_data', 'prepare': 'dkb_verify'}
+    result = []
+    for original in events:
+        e = dict(original)
+        if 'dest' in e:
+            e['dest'] = 'Z:/selftest/Bananza'
+        if e.get('step') in mapping:
+            e['step'] = mapping[e['step']]
+        if e['type'] == 'start':
+            e['steps'] = list(DKB_STEP_ORDER)
+            e['dest'] = 'Z:/selftest/Bananza'
+        if e['type'] == 'plan':
+            e['run'] = [mapping.get(s, s) for s in e.get('run', [])]
+            e['skip'] = {mapping.get(s, s): reason for s, reason in e.get('skip', {}).items()}
+        if e['type'] == 'progress':
+            e['phase'] = 'dkb_run' if e['step'] != 'check' else 'dkb_base'
+        result.append(e)
+    if any(e['type'] == 'end' and e.get('result') == 'ok' for e in result):
+        # A fresh successful Bananza install completed every real stage; show no pending or fictitious skipped work.
+        start = next(e for e in result if e['type'] == 'start')
+        result = [start, {'type': 'plan', 'run': list(DKB_STEP_ORDER), 'skip': {}}]
+        for step in DKB_STEP_ORDER:
+            result += [{'type': 'step', 'step': step, 'state': 'started'},
+                       {'type': 'step', 'step': step, 'state': 'done', 'seconds': 1.0}]
+        result.append({'type': 'end', 'result': 'ok', 'seconds': float(len(DKB_STEP_ORDER))})
+    return result
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument('--selftest', action='store_true')
     ap.add_argument('--shots', type=Path)
     ap.add_argument('--lang', choices=UI_LANGUAGES)
     ap.add_argument('--root', type=Path)
+    ap.add_argument('--game', choices=('bananza', 'totk'), default='bananza')
+    for name in ('package', 'toolchain', 'deps', 'ninja', 'dll-dir', 'translator', 'dotnet'):
+        ap.add_argument('--' + name, type=Path)
+    ap.add_argument('--jobs', type=int, default=6)
     args = ap.parse_args(argv)
     layout = layouts.find(args.root)
     if args.selftest:
-        return selftest(layout, args.shots)
+        return selftest(layout, args.shots, args.game)
     fix_tcl_paths()
+    fix_dpi_awareness()
     root = tk.Tk()
-    App(root, args.lang or windows_ui_language(), layout)
+    tools = {name: getattr(args, name) for name in ('toolchain', 'deps', 'ninja', 'dll_dir', 'translator', 'dotnet', 'jobs')}
+    app = App(root, args.lang or windows_ui_language(), layout, run_args={'tools': tools}, game=args.game)
+    if args.package:
+        app.vars['package'].set(str(args.package))
     root.mainloop()
     return 0
 
