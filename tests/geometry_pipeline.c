@@ -125,14 +125,14 @@ static void topology_tests(void) {
 
 static void cull_tests(const char *dir) {
     static const char *uses[]={"unused","direct","alias","whole","derived",
-        "clip","clip_alias","clip_derived","clip_dynamic","cull_dynamic"};
+        "clip","clip_alias","clip_derived","clip_dynamic","cull_dynamic","ext_literal"};
     for(unsigned k=0;k<sizeof uses/sizeof *uses;k++) {
         char name[64]; snprintf(name,sizeof name,"cull-%s",uses[k]);
         GfxShader s; load_shader(&s,dir,name,GFX_STAGE_GS);
         uint64_t count=0; uint32_t *fixed=spirv_fixup(s.spirv,s.words,&count);
-        if(!k || k==5 || k==8) { CHECK(fixed && count<s.words); }
+        if(!k || k==5 || k==8 || k==10) { CHECK(fixed && count<s.words); }
         else CHECK(!fixed); // Static, aliased or whole-struct use retains CullDistance.
-        if(fixed && (!k || k==5)) {
+        if(fixed && (!k || k==5 || k==10)) {
             unsigned clip=0,cull=0;
             for(uint64_t i=5;i<count;i+=fixed[i]>>16)
                 if((fixed[i]&65535)==72 && fixed[i]>>16==5 && fixed[i+3]==11) {

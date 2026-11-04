@@ -105,6 +105,8 @@ def cull_module(use):
         w.extend([(len(args) + 1) << 16 | code, *args])
     for cap in (1, 2, 32, 33):
         op(17, cap)
+    if use == 'ext_literal':
+        op(11, 50, *struct.unpack('<4I', b'GLSL.std.450\0\0\0\0'))
     op(14, 0, 1)
     op(15, 3, 30, 0x6e69616d, 0, 14, 17)
     for mode, args in ((19, ()), (0, (1,)), (26, (1,)), (27, ())):
@@ -133,6 +135,9 @@ def cull_module(use):
     if use.endswith('dynamic'):
         op(61, 5, 43, 44)
         op(65, 15, 41, 14, 6, 7 if use.startswith('clip') else 21, 43); op(61, 3, 42, 41)
+    elif use == 'ext_literal':
+        # GLSL.std.450 Cos is instruction 14, the input block's id: a literal, not a use.
+        op(12, 3, 46, 50, 14, 19)
     elif use == 'clip':
         op(65, 15, 41, 14, 6, 7, 6); op(61, 3, 42, 41)
     elif use == 'clip_alias':
@@ -317,7 +322,7 @@ def main():
     names.append('gs_flat_builtin')
     for name in names:
         run([args.spirv_val, '--target-env', 'vulkan1.3', args.out / f'{name}.spv'], args.out / f'{name}-val.log')
-    for use in ('unused', 'direct', 'alias', 'whole', 'derived', 'clip', 'clip_alias', 'clip_derived', 'clip_dynamic', 'cull_dynamic'):
+    for use in ('unused', 'direct', 'alias', 'whole', 'derived', 'clip', 'clip_alias', 'clip_derived', 'clip_dynamic', 'cull_dynamic', 'ext_literal'):
         path = args.out / f'cull-{use}.spv'
         path.write_bytes(cull_module(use))
         run([args.spirv_val, '--target-env', 'vulkan1.3', path], args.out / f'cull-{use}-val.log')
@@ -339,7 +344,7 @@ def main():
         run([args.spirv_val, '--target-env', 'vulkan1.3', args.out / f'portable-module{index}.spv'],
             args.out / f'portable-module{index}-val.log')
     run([args.spirv_val, '--target-env', 'vulkan1.3', args.out / 'plain-vs.spv'], args.out / 'plain-vs-val.log')
-    for use in ('unused', 'clip'):
+    for use in ('unused', 'clip', 'ext_literal'):
         run([args.spirv_val, '--target-env', 'vulkan1.3', args.out / f'fixed-cull-{use}.spv'], args.out / f'fixed-cull-{use}-val.log')
     manifest = {'optimization': args.opt, 'result': output.strip(),
         'complete_spirv_validations': len(list(args.out.glob('*-val.log'))), 'providers': [

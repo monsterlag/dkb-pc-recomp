@@ -821,7 +821,7 @@ static uint32_t *spirv_add_outputs(const uint32_t *w, uint64_t n, uint32_t missi
 //    every surviving member index. Declaring ClipDistance[8] in both blocks alone
 //    can exceed the entry-point combined distance limit even when unused.
 static uint32_t *spirv_fixup_linked(const uint32_t *w, uint64_t n, uint64_t *out_n, int geometry_chain) {
-    enum { OP_EXTENSION = 10, OP_CAPABILITY = 17, OP_MEMBER_NAME = 6, OP_EXECUTION_MODE = 16, OP_TYPE_ARRAY = 28,
+    enum { OP_EXTENSION = 10, OP_EXT_INST = 12, OP_CAPABILITY = 17, OP_MEMBER_NAME = 6, OP_EXECUTION_MODE = 16, OP_TYPE_ARRAY = 28,
            OP_TYPE_STRUCT = 30, OP_CONSTANT = 43, OP_MEMBER_DECORATE = 72, OP_ACCESS_CHAIN = 65, OP_IN_BOUNDS_ACCESS_CHAIN = 66,
            OP_BEGIN_INTERLOCK = 5364, OP_END_INTERLOCK = 5365, CAP_SAMPLE_INTERLOCK = 5363, CAP_PIXEL_INTERLOCK = 5378,
            CAP_RATE_INTERLOCK = 5372, BUILTIN_CLIP = 3, BUILTIN_CULL = 4 };
@@ -889,6 +889,9 @@ static uint32_t *spirv_fixup_linked(const uint32_t *w, uint64_t n, uint64_t *out
                 }
             }
             if (in_function) for (uint32_t k = 0; k + 1 < l; k++) {
+                // OpExtInst's fourth word is the instruction number, a literal: GLSL.std.450 Fma is 50, the same
+                // number as the gl_PerVertex variable in many vertex shaders, and read as an id it kept CullDistance.
+                if (op == OP_EXT_INST && k == 3) continue;
                 uint32_t t = a[k] < bound ? var_type[a[k]] : 0;
                 if (t != b->type && !(t < bound && t && elem[t] == b->type)) continue;
                 // Only a direct, constant-member access proves which member is
