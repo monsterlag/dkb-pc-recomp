@@ -15,6 +15,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools'))
@@ -206,6 +207,99 @@ class ExtractNupTest(unittest.TestCase):
         code, out, _ = run(path, '--out', out_dir, '--quiet')
         self.assertEqual(code, 0)
         self.assertIn('already there', out)
+
+    def test_preexisting_part_symlink_is_not_followed(self):
+        path = self.write(build([(0, 0x0100AAAA, 0, {'exefs': {'main': MAIN}})]))
+        out_dir = self.dir / 'out' / 'exefs'
+        out_dir.mkdir(parents=True)
+        outside = self.write(b'outside sentinel', 'outside.txt')
+        link = out_dir / 'main.part'
+        try:
+            link.symlink_to(outside)
+        except OSError as e:
+            if sys.platform == 'win32' and getattr(e, 'winerror', None) == 1314:
+                self.skipTest('Windows symlink privilege unavailable; run this original case on POSIX')
+            raise
+        with contextlib.closing(nup.Nup(path)) as parsed:
+            nup.extract_tree(parsed, None, parsed.packages[0], 'exefs', out_dir, True, True)
+        self.assertEqual(outside.read_bytes(), b'outside sentinel')
+        self.assertTrue(link.is_symlink())
+        self.assertEqual((out_dir / 'main').read_bytes(), MAIN)
+
+    def test_part_named_entry_and_file_both_survive_resume(self):
+        expected = {'foo.part': b'legitimate archive part file', 'foo': b'different final bytes'}
+        path = self.write(build([(0, 0x0100AAAA, 0, {'exefs': expected})]))
+        out_dir = self.dir / 'out' / 'exefs'
+        with contextlib.closing(nup.Nup(path)) as parsed:
+            self.assertEqual([parts for parts, _ in parsed.package_files(parsed.packages[0], 'exefs')],
+                             [('foo.part',), ('foo',)])
+            first = nup.extract_tree(parsed, None, parsed.packages[0], 'exefs', out_dir, True, True)
+            self.assertEqual(first, (2, sum(map(len, expected.values())), 0))
+            for name, data in expected.items():
+                self.assertEqual((out_dir / name).read_bytes(), data)
+                self.assertEqual(nup._hash(out_dir / name), hashlib.sha256(data).digest())
+            resumed = nup.extract_tree(parsed, None, parsed.packages[0], 'exefs', out_dir, True, True)
+            self.assertEqual(resumed, (2, sum(map(len, expected.values())), 2))
+            self.assertEqual({p.name: p.read_bytes() for p in out_dir.iterdir()}, expected)
+
+    def test_hash_failure_preserves_existing_final_and_stale_parts(self):
+        data = bytearray(build([(0, 0x0100AAAA, 0, {'exefs': {'main': MAIN}})]))
+        data[-5] ^= 0xff
+        path = self.write(data)
+        out_dir = self.dir / 'out' / 'exefs'
+        out_dir.mkdir(parents=True)
+        expected = {'main': b'old final', 'main.part': b'stale partial', 'other.part': b'unrelated data'}
+        for name, value in expected.items():
+            (out_dir / name).write_bytes(value)
+        with contextlib.closing(nup.Nup(path)) as parsed:
+            with self.assertRaisesRegex(nup.NupError, 'SHA-256'):
+                nup.extract_tree(parsed, None, parsed.packages[0], 'exefs', out_dir, True, True)
+        self.assertEqual({p.name: p.read_bytes() for p in out_dir.iterdir()}, expected)
+
+    def test_stream_failure_removes_only_its_created_temp(self):
+        path = self.write(build([(0, 0x0100AAAA, 0, {'exefs': {'main': MAIN}})]))
+        out_dir = self.dir / 'out' / 'exefs'
+        out_dir.mkdir(parents=True)
+        expected = {'main.part': b'stale partial', 'other.part': b'unrelated data'}
+        for name, value in expected.items():
+            (out_dir / name).write_bytes(value)
+
+        class FailingRead:
+            """Original I/O fault after a real container byte; no OS permission failure."""
+            def __init__(self, source):
+                self.source = source
+                self.reads = 0
+
+            def seek(self, offset):
+                return self.source.seek(offset)
+
+            def read(self, size):
+                self.reads += 1
+                if self.reads == 1:
+                    return self.source.read(1)
+                raise OSError('synthetic container read failure')
+
+            def close(self):
+                self.source.close()
+
+        with contextlib.closing(nup.Nup(path)) as parsed:
+            parsed.f = FailingRead(parsed.f)
+            with self.assertRaisesRegex(OSError, 'synthetic container read failure'):
+                nup.extract_tree(parsed, None, parsed.packages[0], 'exefs', out_dir, True, True)
+        self.assertEqual({p.name: p.read_bytes() for p in out_dir.iterdir()}, expected)
+
+    def test_publish_failure_preserves_unrelated_files(self):
+        path = self.write(build([(0, 0x0100AAAA, 0, {'exefs': {'main': MAIN}})]))
+        out_dir = self.dir / 'out' / 'exefs'
+        out_dir.mkdir(parents=True)
+        expected = {'main': b'old final', 'main.part': b'stale partial', 'other.part': b'unrelated data'}
+        for name, value in expected.items():
+            (out_dir / name).write_bytes(value)
+        with contextlib.closing(nup.Nup(path)) as parsed:
+            with mock.patch.object(nup.os, 'replace', side_effect=OSError('synthetic publish failure')):
+                with self.assertRaisesRegex(OSError, 'synthetic publish failure'):
+                    nup.extract_tree(parsed, None, parsed.packages[0], 'exefs', out_dir, True, True)
+        self.assertEqual({p.name: p.read_bytes() for p in out_dir.iterdir()}, expected)
 
     def test_corrupt_file_is_refused(self):
         data = bytearray(build([(0, 0x0100AAAA, 0, {'exefs': {'main': MAIN}})]))

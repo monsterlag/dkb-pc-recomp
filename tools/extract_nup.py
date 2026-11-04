@@ -27,6 +27,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -241,35 +242,41 @@ def _read_exact(src, n):
 def extract_file(nup, zstd, idx, dest, verify):
     name, size, ext_off, ext_size, sha, codec = nup.files[idx]
     dest.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dest.with_name(dest.name + '.part')
+    tmp = None
     h = hashlib.sha256()
     written = 0
-    with open(tmp, 'wb') as out:
-        if size:
-            nup.f.seek(ext_off)
-            if codec == CODEC_RAW:
-                left = size
-                while left:
-                    chunk = nup.f.read(min(CHUNK, left))
-                    if not chunk:
-                        raise NupError(f'{name}: the container ends inside the file')
-                    left -= len(chunk)
-                    h.update(chunk)
-                    out.write(chunk)
-                    written += len(chunk)
-            else:
-                for chunk in zstd.stream(nup.f, ext_size):
-                    h.update(chunk)
-                    out.write(chunk)
-                    written += len(chunk)
-    if written != size:
-        tmp.unlink()
-        raise NupError(f'{name}: expected {size} bytes, got {written}')
-    if verify and h.digest() != sha:
-        tmp.unlink()
-        raise NupError(f'{name}: SHA-256 differs from the container record (corrupt container)')
-    os.replace(tmp, dest)
-    return written
+    try:
+        # Exclusive creation avoids existing links, stale partials and legitimate
+        # archive entries named <destination>.part. Keep replacement on one filesystem.
+        with tempfile.NamedTemporaryFile(mode='wb', prefix='.nup-', suffix='.part',
+                                         dir=dest.parent, delete=False) as out:
+            tmp = Path(out.name)
+            if size:
+                nup.f.seek(ext_off)
+                if codec == CODEC_RAW:
+                    left = size
+                    while left:
+                        chunk = nup.f.read(min(CHUNK, left))
+                        if not chunk:
+                            raise NupError(f'{name}: the container ends inside the file')
+                        left -= len(chunk)
+                        h.update(chunk)
+                        out.write(chunk)
+                        written += len(chunk)
+                else:
+                    for chunk in zstd.stream(nup.f, ext_size):
+                        h.update(chunk)
+                        out.write(chunk)
+                        written += len(chunk)
+        if written != size:
+            raise NupError(f'{name}: expected {size} bytes, got {written}')
+        if verify and h.digest() != sha:
+            raise NupError(f'{name}: SHA-256 differs from the container record (corrupt container)')
+        os.replace(tmp, dest)
+        return written
+    finally:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
 
 
 def extract_tree(nup, zstd, pkg, which, out_dir, verify, quiet):
