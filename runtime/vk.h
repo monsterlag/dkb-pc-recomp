@@ -137,8 +137,8 @@ int  vk_pool_init(pool_t *p);              // CPU-visible: guest storage importe
                                            // VkBuffer; physical: device-local memory; virtual: a 64 KiB page table
 void vk_pool_fini(pool_t *p);              // drops images cut from the pool; waits for the GPU if it used the pool
 int  vk_pool_map_virtual(pool_t *v, int n, const void *requests);   // nvn_mapping_t[n], checked by the front end
-void vk_texture_register(int id, const tex_t *t, const view_t *v);  // texture descriptor slot (copied)
-void vk_sampler_register(int id, const samp_par *s);                // sampler descriptor slot (copied)
+void vk_texture_register(const dpool_ref *pool, int id, const tex_t *t, const view_t *v);
+void vk_sampler_register(const dpool_ref *pool, int id, const samp_par *s);
 void vk_texture_release(const tex_t *t);   // TextureFinalize: the image stays for slots that still name its storage
 void vk_read_texels(const tex_t *t, const view_t *v, const NVNcopyRegion *r, uint8_t *dst, uint64_t row, uint64_t img);
 void vk_write_texels(const tex_t *t, const view_t *v, const NVNcopyRegion *r, const uint8_t *src, uint64_t row, uint64_t img);
@@ -155,6 +155,12 @@ typedef struct {
     int cls;
     void *pool;   // the imported pool record behind the span (NULL for device memory), for VK_MEM_BOUND
 } VkMemSpan;
+
+// Canonical descriptor bytes: imported storage uses its host address (storage 0); device storage a unique physical
+// lifetime and byte offset. A virtual alias resolves to the same key as its physical storage. No GPU-use side effects.
+typedef struct { uint64_t storage, offset; } VkDescKey;
+int vk_mem_descriptor_key(uint64_t addr, uint64_t size, VkDescKey *out);
+void vk_texture_descriptors_retire(uint64_t addr, uint64_t size, uint64_t storage);
 // Traffic census (vk_memory.c vk_mem_census): bytes the replay binds or copies, by pool class and use. Imported pools by
 // their CPU access flag; DEVICE is physical memory (directly or through a virtual pool); SCRATCH the replay's transient
 // copies. CPU_READ counts bytes host code reads from pool storage in place of the GPU (misaligned binds, byte indices,
@@ -312,22 +318,22 @@ typedef struct {
 } VkTexImage;
 const VkTexImage *vk_texture_get(const tex_t *t);   // created and made current; NULL for BUFFER or unmapped formats
 // A texture slot; a slot whose texture was finalized follows the live texture at the same storage (hle_nvn.c).
-const VkTexImage *vk_texture_by_id(int id, view_t *view, int *has_view);
+const VkTexImage *vk_texture_by_id(const dpool_ref *pool, int id, view_t *view, int *has_view);
 // The replay looks up many slots per draw: it takes the texture lock once around them (vk_texture_lock) and uses the
 // _locked lookups; vk_texture_slots_gen changes whenever a slot may resolve to another image or view.
 void vk_texture_lock(void);
 void vk_texture_unlock(void);
-const VkTexImage *vk_texture_by_id_locked(int id, view_t *view, int *has_view);
-VkSampler vk_sampler_by_id_locked(int id);
+const VkTexImage *vk_texture_by_id_locked(const dpool_ref *pool, int id, view_t *view, int *has_view);
+VkSampler vk_sampler_by_id_locked(const dpool_ref *pool, int id);
 // The slot's sampler with nearest filtering and no anisotropy: a depth texture read without a compare lands on one texel
 // on the Switch although the game binds a linear sampler, and MacNativeGames samples it the same way. VK_NULL_HANDLE
 // for an empty slot.
-VkSampler vk_sampler_point_by_id_locked(int id);
+VkSampler vk_sampler_point_by_id_locked(const dpool_ref *pool, int id);
 uint32_t vk_texture_slots_gen(void);
 // What vk_texture_by_id(id) returns can change only when this does: the slot is registered again, or a texture entry at
 // its storage address is created, dropped, released or taken back into use. Unlocked; read it before the lookup it
 // guards (a lookup may create an entry). 0 when the slot was never registered: nothing is kept under 0.
-uint64_t vk_texture_slot_token(int id);
+uint64_t vk_texture_slot_token(const dpool_ref *pool, int id);
 uint32_t vk_sampler_gen(void);                      // changes whenever a sampler slot is registered
 void vk_texture_gpu_written(const tex_t *t);        // rendered or copied into by the GPU: no re-upload from storage
 void vk_texture_storage_bound_locked(const VkTexImage *img);   // bound as a storage image in the recording submission
@@ -336,7 +342,7 @@ size_t vk_texture_texel_span(const tex_t *t, const view_t *v, const NVNcopyRegio
 int vk_texture_small_dirty(void);                   // a small mirrored target holds GPU texels its storage lacks
 void vk_texture_write_back_small(uint64_t fence);   // writes those rendered by work up to fence back to storage
 void vk_texture_debug(const VkTexImage *img, uint32_t *uploads, int *last_change, int *pages_written);   // vk_dump
-int vk_texture_slot_swz(int id, uint8_t swz[4]);    // vk_dump: swizzle of the descriptor in slot id
+int vk_texture_slot_swz(const dpool_ref *pool, int id, uint8_t swz[4]);
 int vk_texture_read_image(const tex_t *t, const view_t *v, const NVNcopyRegion *r, uint8_t *dst, uint64_t row,
                           uint64_t img);            // always from the image (GPU copy, waited for); 0 on failure
 int vk_texture_cpu_stale(uint64_t addr, uint64_t size);    // a GPU-written mirrored texture there has stale storage
@@ -351,9 +357,9 @@ void vk_texture_census(VkTexCensus *s);
 void vk_texture_shutdown(void);                     // vk_mem_shutdown calls it
 void vk_texture_new_submit(void);                   // a queue submit starts: draw bindings check storage again
 uint32_t vk_texture_epoch(void);                    // the write-watch snapshot epoch vk_texture_new_submit started
-VkSampler vk_sampler_by_id(int id);                 // VK_NULL_HANDLE for an empty slot
+VkSampler vk_sampler_by_id(const dpool_ref *pool, int id);
 VkSampler vk_sampler_for(const samp_par *s);        // cached by content
-int vk_sampler_params(int id, samp_par *out);       // parameters of a sampler slot; 0 for an empty slot
+int vk_sampler_params(const dpool_ref *pool, int id, samp_par *out);
 
 // 8-bit RGBA PNG with stored deflate blocks (boot.c); stops with rt_fatal when the file cannot be written.
 void rt_write_png(const char *path, const uint8_t *rgba, uint32_t w, uint32_t h);

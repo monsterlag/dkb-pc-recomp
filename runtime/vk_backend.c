@@ -385,8 +385,8 @@ static int vk_be_pool_map_virtual(pool_t *v, int n, const void *requests) {
     vk_present_drain();
     return vk_pool_map_virtual(v, n, requests);
 }
-static void vk_be_texture_register(int id, const tex_t *t, const view_t *v) { vk_sync_start(); vk_texture_register(id, t, v); }
-static void vk_be_sampler_register(int id, const samp_par *s) { vk_sync_start(); vk_sampler_register(id, s); }
+static void vk_be_texture_register(const dpool_ref *pool, int id, const tex_t *t, const view_t *v) { vk_sync_start(); vk_texture_register(pool, id, t, v); }
+static void vk_be_sampler_register(const dpool_ref *pool, int id, const samp_par *s) { vk_sync_start(); vk_sampler_register(pool, id, s); }
 // Asynchronous: the release is queued behind the submissions before it, so their replay still resolves the texture's
 // slots to its image (a released slot follows another live texture at the storage), and the ones after it see it
 // released, the order of the synchronous replay. vk_texture_release reads only the object's key fields: a copy.

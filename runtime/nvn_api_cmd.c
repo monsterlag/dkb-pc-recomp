@@ -825,8 +825,16 @@ NVN_API(nvnCommandBufferSetColorReductionThresholds) { (void)c; }
 // void nvnCommandBufferBarrier(NVNcommandBuffer *cmd, int bits)
 NVN_API(nvnCommandBufferBarrier) { REC(cmd_of(c), OP_BARRIER, p_barrier)->bits = (int)arg_x(c, 1); }
 // void nvnCommandBufferSetTexturePool / SetSamplerPool(NVNcommandBuffer *cmd, const NVNtexturePool / NVNsamplerPool *)
-NVN_API(nvnCommandBufferSetTexturePool) { REC(cmd_of(c), OP_SET_TEX_POOL, p_set_pool)->pool = arg_p(c, 1); }
-NVN_API(nvnCommandBufferSetSamplerPool) { REC(cmd_of(c), OP_SET_SAMP_POOL, p_set_pool)->pool = arg_p(c, 1); }
+NVN_API(nvnCommandBufferSetTexturePool) {
+    dpool_ref pool;
+    if (!nvn_dpool_snapshot(arg_p(c, 1), 1u << 20, &pool)) rt_fatal("nvn: invalid texture descriptor pool");
+    REC(cmd_of(c), OP_SET_TEX_POOL, p_set_pool)->pool = pool;
+}
+NVN_API(nvnCommandBufferSetSamplerPool) {
+    dpool_ref pool;
+    if (!nvn_dpool_snapshot(arg_p(c, 1), 1u << 12, &pool)) rt_fatal("nvn: invalid sampler descriptor pool");
+    REC(cmd_of(c), OP_SET_SAMP_POOL, p_set_pool)->pool = pool;
+}
 // void nvnCommandBufferCopyBufferToTexture(NVNcommandBuffer *cmd, NVNbufferAddress src, const NVNtexture *dst,
 // const NVNtextureView *view, const NVNcopyRegion *region, int flags)
 NVN_API(nvnCommandBufferCopyBufferToTexture) {

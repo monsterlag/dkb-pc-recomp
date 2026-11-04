@@ -75,15 +75,17 @@ typedef struct {
 } TexSlot;
 typedef struct { samp_par p; VkSampler s, sp; uint8_t used; } SampSlot;   // s: vk_sampler_for(&p) once looked up; sp:
                                                                            // its point-sampled form (vk_sampler_point_by_id_locked)
+enum { DESC_TEXTURE = 1, DESC_SAMPLER };
+typedef struct {
+    uint32_t kind, serial;
+    union { TexSlot tex; SampSlot sampler; } u;
+} DescSlot;
 
 static PlatRMutex tex_lock;
 static PlatOnce tex_once = PLAT_ONCE_INIT;
 static nvn_hmap by_key = {.klen = sizeof(TexKey)};
 static nvn_hmap by_addr = {.klen = 8};
-static TexSlot *tslots;
-static int ntslots;
-static SampSlot *sslots;
-static int nsslots;
+static nvn_hmap descriptors = {.klen = sizeof(VkDescKey)};
 static nvn_hmap samplers = {.klen = sizeof(samp_par)};
 static int nreleased;
 static Tex *rel_head, *rel_tail;   // released entries in release order (sweep_released drops from the head)
@@ -115,10 +117,6 @@ static uint64_t n_checks;    // draw-binding storage checks (make_fresh_snap) si
 // which emptied every cache keyed on the global generations.
 #define AGEN_N 4096
 static uint32_t agen[AGEN_N];
-// Per slot id, for vk_texture_slot_token without the lock: the registration serial (bits 16-47; 0: never registered)
-// and the address generation index (bits 0-15), one word so a reader gets a consistent pair. Fixed-size (slot ids are
-// 20 bits), unlike tslots, which moves when it grows.
-static uint64_t *sinfo;
 static uint32_t reg_serial;
 
 static uint32_t agen_idx(uint64_t addr) { return (uint32_t)(addr * 0x9E3779B97F4A7C15ull >> 52); }
@@ -1017,29 +1015,47 @@ void vk_texture_range_gone(uint64_t lo, uint64_t size, VmaAllocation alloc) {
 }
 
 // ---------------------------------------------------------------- descriptor slots
-void vk_texture_register(int id, const tex_t *t, const view_t *v) {
-    if (id < 0 || id >= (1 << 20)) rt_fatal("vk: texture slot %d out of range", id);
+static int descriptor_key(const dpool_ref *pool, int id, uint32_t limit, VkDescKey *key) {
+    if (!pool || !pool->addr || !pool->count || pool->count > limit || id < 0 || (uint32_t)id >= pool->count ||
+        pool->addr % NVN_DESCRIPTOR_BYTES || pool->addr > UINT64_MAX - (uint64_t)pool->count * NVN_DESCRIPTOR_BYTES) return 0;
+    return vk_mem_descriptor_key(pool->addr + (uint64_t)(uint32_t)id * NVN_DESCRIPTOR_BYTES, NVN_DESCRIPTOR_BYTES, key);
+}
+
+// Texture lock held. Entries are addressed by their bytes, so wrappers and overlapping table views share updates.
+static DescSlot *descriptor_slot(const dpool_ref *pool, int id, uint32_t limit, int create) {
+    VkDescKey key;
+    if (!descriptor_key(pool, id, limit, &key)) return NULL;
+    DescSlot *d = nvn_hm_get(&descriptors, &key);
+    if (!d && create) {
+        d = calloc(1, sizeof *d);
+        if (!d) rt_fatal("vk: out of memory for a descriptor");
+        nvn_hm_put(&descriptors, &key, d);
+    }
+    return d;
+}
+
+static void descriptor_registered(DescSlot *d, uint32_t kind) {
+    memset(d, 0, sizeof *d);
+    if (!++reg_serial) ++reg_serial;
+    d->serial = reg_serial, d->kind = kind;
+    slots_gen++, samp_gen++;   // a registration can replace bytes previously used by either kind
+}
+
+void vk_texture_register(const dpool_ref *pool, int id, const tex_t *t, const view_t *v) {
+    static volatile int32_t n_unbacked;
+    if (!pool || id < 0 || id >= (1 << 20) || (uint32_t)id >= pool->count) rt_fatal("vk: texture slot %d out of pool range", id);
     lock();
-    if (id >= ntslots) {
-        int n = ntslots ? ntslots : 1024;
-        while (n <= id) n *= 2;
-        TexSlot *s = realloc(tslots, sizeof *s * (size_t)n);
-        if (!s) rt_fatal("vk: out of memory for texture slots");
-        memset(s + ntslots, 0, sizeof *s * (size_t)(n - ntslots));
-        tslots = s, ntslots = n;
+    DescSlot *d = descriptor_slot(pool, id, 1u << 20, 1);
+    if (!d) {
+        log_limited(&n_unbacked, "texture descriptor slot %d has no mapped backing: not registered", id);
+        unlock();
+        return;
     }
-    if (!sinfo) {
-        uint64_t *p = calloc(1 << 20, sizeof *p);
-        if (!p) rt_fatal("vk: out of memory for texture slot tokens");
-        __atomic_store_n(&sinfo, p, __ATOMIC_RELEASE);
-    }
-    TexSlot *s = &tslots[id];
+    descriptor_registered(d, DESC_TEXTURE);
+    TexSlot *s = &d->u.tex;
     s->t = *t;
     s->used = 1;
     s->ce = NULL;
-    slots_gen++;
-    if (!++reg_serial) reg_serial = 1;
-    __atomic_store_n(&sinfo[id], (uint64_t)reg_serial << 16 | agen_idx((uintptr_t)t->mem), __ATOMIC_RELEASE);
     s->has_view = v != NULL;
     if (v) s->v = *v;
     else memset(&s->v, 0, sizeof s->v);
@@ -1091,25 +1107,29 @@ void vk_texture_lock(void) { lock(); }
 void vk_texture_unlock(void) { unlock(); }
 uint32_t vk_texture_slots_gen(void) { return slots_gen; }
 
-uint64_t vk_texture_slot_token(int id) {
-    const uint64_t *si = __atomic_load_n(&sinfo, __ATOMIC_ACQUIRE);
-    if (!si || id < 0 || id >= (1 << 20)) return 0;
-    uint64_t v = __atomic_load_n(&si[id], __ATOMIC_ACQUIRE);
-    return v ? (v >> 16) << 32 | __atomic_load_n(&agen[v & 0xffff], __ATOMIC_ACQUIRE) : 0;
+uint64_t vk_texture_slot_token(const dpool_ref *pool, int id) {
+    // tex_lock is recursive: callers may already hold it, or may be checking a cache before acquiring it.
+    lock();
+    DescSlot *d = descriptor_slot(pool, id, 1u << 20, 0);
+    uint64_t token = d && d->kind == DESC_TEXTURE ? (uint64_t)d->serial << 32 |
+        __atomic_load_n(&agen[agen_idx((uintptr_t)d->u.tex.t.mem)], __ATOMIC_ACQUIRE) : 0;
+    unlock();
+    return token;
 }
 uint32_t vk_sampler_gen(void) { return __atomic_load_n(&samp_gen, __ATOMIC_RELAXED); }
 
-const VkTexImage *vk_texture_by_id(int id, view_t *view, int *has_view) {
+const VkTexImage *vk_texture_by_id(const dpool_ref *pool, int id, view_t *view, int *has_view) {
     lock();
-    const VkTexImage *r = vk_texture_by_id_locked(id, view, has_view);
+    const VkTexImage *r = vk_texture_by_id_locked(pool, id, view, has_view);
     unlock();
     return r;
 }
 
-const VkTexImage *vk_texture_by_id_locked(int id, view_t *view, int *has_view) {
-    if (id < 0 || id >= ntslots || !tslots[id].used) return NULL;
-    TexSlot *s = &tslots[id];
-    uint32_t g = agen[sinfo[id] & 0xffff];
+const VkTexImage *vk_texture_by_id_locked(const dpool_ref *pool, int id, view_t *view, int *has_view) {
+    DescSlot *d = descriptor_slot(pool, id, 1u << 20, 0);
+    if (!d || d->kind != DESC_TEXTURE) return NULL;
+    TexSlot *s = &d->u.tex;
+    uint32_t g = agen[agen_idx((uintptr_t)s->t.mem)];
     if (!s->ce || s->cgen != g) {   // resolved again: an entry at its address was created, dropped or released, or the
         view_t v;                   // slot registered (s->ce cleared); an empty result is not kept: image creation may
         int hv;                     // succeed later
@@ -1135,11 +1155,12 @@ const VkTexImage *vk_texture_by_id_locked(int id, view_t *view, int *has_view) {
 }
 
 // vk_dump: the swizzle selectors of the descriptor registered in slot id; 0 when the slot is empty.
-int vk_texture_slot_swz(int id, uint8_t swz[4]) {
+int vk_texture_slot_swz(const dpool_ref *pool, int id, uint8_t swz[4]) {
     lock();
-    int ok = id >= 0 && id < ntslots && tslots[id].used;
+    DescSlot *s = descriptor_slot(pool, id, 1u << 20, 0);
+    int ok = s && s->kind == DESC_TEXTURE;
     if (ok) {
-        const nvn_texdesc *d = &tslots[id].t.d;
+        const nvn_texdesc *d = &s->u.tex.t.d;
         swz[0] = (uint8_t)d->swizzle_r, swz[1] = (uint8_t)d->swizzle_g, swz[2] = (uint8_t)d->swizzle_b;
         swz[3] = (uint8_t)d->swizzle_a;
     }
@@ -1658,21 +1679,19 @@ static VkSampler make_sampler(VkCtx *c, const samp_par *d) {
     return s;
 }
 
-void vk_sampler_register(int id, const samp_par *s) {
-    if (id < 0 || id >= (1 << 12)) rt_fatal("vk: sampler slot %d out of range", id);
+void vk_sampler_register(const dpool_ref *pool, int id, const samp_par *s) {
+    static volatile int32_t n_unbacked;
+    if (!pool || id < 0 || id >= (1 << 12) || (uint32_t)id >= pool->count) rt_fatal("vk: sampler slot %d out of pool range", id);
     lock();
-    if (id >= nsslots) {
-        int n = nsslots ? nsslots : 256;
-        while (n <= id) n *= 2;
-        SampSlot *p = realloc(sslots, sizeof *p * (size_t)n);
-        if (!p) rt_fatal("vk: out of memory for sampler slots");
-        memset(p + nsslots, 0, sizeof *p * (size_t)(n - nsslots));
-        sslots = p, nsslots = n;
+    DescSlot *d = descriptor_slot(pool, id, 1u << 12, 1);
+    if (!d) {
+        log_limited(&n_unbacked, "sampler descriptor slot %d has no mapped backing: not registered", id);
+        unlock();
+        return;
     }
-    sslots[id].p = *s;
-    sslots[id].s = sslots[id].sp = VK_NULL_HANDLE;
-    sslots[id].used = 1;
-    samp_gen++;
+    descriptor_registered(d, DESC_SAMPLER);
+    d->u.sampler.p = *s;
+    d->u.sampler.used = 1;
     unlock();
 }
 
@@ -1699,22 +1718,24 @@ VkSampler vk_sampler_for(const samp_par *s) {
 }
 
 // Samplers live until shutdown, so a slot keeps the one its parameters map to until it is registered again.
-VkSampler vk_sampler_by_id_locked(int id) {
+VkSampler vk_sampler_by_id_locked(const dpool_ref *pool, int id) {
     VkCtx *c = vk_ctx();
     if (!c) return VK_NULL_HANDLE;
     VkSampler v = VK_NULL_HANDLE;
-    if (id >= 0 && id < nsslots && sslots[id].used) {
-        SampSlot *s = &sslots[id];
+    DescSlot *d = descriptor_slot(pool, id, 1u << 12, 0);
+    if (d && d->kind == DESC_SAMPLER) {
+        SampSlot *s = &d->u.sampler;
         if (!s->s) s->s = sampler_for(c, &s->p);
         v = s->s;
     }
     return v;
 }
 
-VkSampler vk_sampler_point_by_id_locked(int id) {
+VkSampler vk_sampler_point_by_id_locked(const dpool_ref *pool, int id) {
     VkCtx *c = vk_ctx();
-    if (!c || id < 0 || id >= nsslots || !sslots[id].used) return VK_NULL_HANDLE;
-    SampSlot *s = &sslots[id];
+    DescSlot *d = descriptor_slot(pool, id, 1u << 12, 0);
+    if (!c || !d || d->kind != DESC_SAMPLER) return VK_NULL_HANDLE;
+    SampSlot *s = &d->u.sampler;
     if (!s->sp) {
         samp_par k = s->p;
         k.magf = NVN_MAG_FILTER_NEAREST;
@@ -1726,19 +1747,45 @@ VkSampler vk_sampler_point_by_id_locked(int id) {
     return s->sp;
 }
 
-VkSampler vk_sampler_by_id(int id) {
+VkSampler vk_sampler_by_id(const dpool_ref *pool, int id) {
     lock();
-    VkSampler v = vk_sampler_by_id_locked(id);
+    VkSampler v = vk_sampler_by_id_locked(pool, id);
     unlock();
     return v;
 }
 
-int vk_sampler_params(int id, samp_par *out) {
+int vk_sampler_params(const dpool_ref *pool, int id, samp_par *out) {
     lock();
-    int ok = id >= 0 && id < nsslots && sslots[id].used;
-    if (ok) *out = sslots[id].p;
+    DescSlot *d = descriptor_slot(pool, id, 1u << 12, 0);
+    int ok = d && d->kind == DESC_SAMPLER;
+    if (ok) *out = d->u.sampler.p;
     unlock();
     return ok;
+}
+
+// A backing lifetime ended. Keep imported entries while another live imported alias still maps the same bytes.
+// pool_lock is not held by the caller; taking it through descriptor_key while holding tex_lock preserves lock order.
+void vk_texture_descriptors_retire(uint64_t addr, uint64_t size, uint64_t storage) {
+    lock();
+    VkDescKey *gone = malloc(sizeof *gone * (size_t)(descriptors.n + 1));
+    if (!gone) rt_fatal("vk: out of memory retiring descriptors");
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < descriptors.cap; i++) {
+        if (!descriptors.vals[i]) continue;
+        VkDescKey key;
+        memcpy(&key, descriptors.keys + (size_t)i * descriptors.klen, sizeof key);
+        if (key.storage != storage) continue;
+        if (!storage) {
+            if (key.offset >= addr ? key.offset - addr >= size : addr - key.offset >= NVN_DESCRIPTOR_BYTES) continue;
+            VkDescKey live;
+            if (vk_mem_descriptor_key(key.offset, NVN_DESCRIPTOR_BYTES, &live) && !memcmp(&live, &key, sizeof key)) continue;
+        }
+        gone[n++] = key;
+    }
+    for (uint32_t i = 0; i < n; i++) free(nvn_hm_del(&descriptors, &gone[i]));
+    if (n) slots_gen++, samp_gen++;
+    free(gone);
+    unlock();
 }
 
 // ---------------------------------------------------------------- statistics and shutdown
@@ -1784,9 +1831,10 @@ void vk_texture_shutdown(void) {
     by_key = (nvn_hmap){.klen = sizeof(TexKey)};
     by_addr = (nvn_hmap){.klen = 8};
     samplers = (nvn_hmap){.klen = sizeof(samp_par)};
-    free(tslots), free(sslots);
-    tslots = NULL, sslots = NULL, ntslots = nsslots = 0, nreleased = 0;
+    for (uint32_t i = 0; i < descriptors.cap; i++) free(descriptors.vals[i]);
+    free(descriptors.keys), free(descriptors.vals);
+    descriptors = (nvn_hmap){.klen = sizeof(VkDescKey)};
+    nreleased = 0;
     rel_head = rel_tail = NULL;
-    if (sinfo) memset(sinfo, 0, sizeof *sinfo << 20);   // no slot is registered: tokens 0
     unlock();
 }

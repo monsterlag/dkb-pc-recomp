@@ -610,7 +610,7 @@ static void describe_bindings(Str *b, const VkExec *ex, const VkPipeInfo *info) 
             if (!h) { sp(b, "no handle (dummy)\n"); continue; }
             view_t v;
             int hv = 0;
-            const VkTexImage *t = vk_texture_by_id(NVN_HANDLE_TEX(h), &v, &hv);
+            const VkTexImage *t = vk_texture_by_id(&ex->tex_pool, NVN_HANDLE_TEX(h), &v, &hv);
             if (!t) { sp(b, "tex %d unresolved (dummy)\n", NVN_HANDLE_TEX(h)); continue; }
             static const char *vt[] = {"1D", "2D", "3D", "cube", "1DArray", "2DArray", "cubeArray"};
             sp(b, "tex %d %s(%d) %ux%ux%u levels %u layers %u image %s", NVN_HANDLE_TEX(h), fmt_name(t->format, fn),
@@ -624,7 +624,7 @@ static void describe_bindings(Str *b, const VkExec *ex, const VkPipeInfo *info) 
                 // storage image: no sampler
             } else if (r->separate) {
                 sp(b, " | separate sampler (not replayed: default sampler)");
-            } else if (vk_sampler_params(NVN_HANDLE_SAMP(h), &s)) {
+            } else if (vk_sampler_params(&ex->samp_pool, NVN_HANDLE_SAMP(h), &s)) {
                 static const char *minn[] = {"N", "L", "N_mipN", "L_mipN", "N_mipL", "L_mipL"};
                 int mf = s.minf;
                 sp(b, " | samp %d: mag %s min %s (vk min %s mip %s) wrap %s/%s/%s aniso %g lod %g..%g bias %g%s",
@@ -641,7 +641,7 @@ static void describe_bindings(Str *b, const VkExec *ex, const VkPipeInfo *info) 
             sp(b, " | addr %#llx mirrored %d gpu_owned %d bound %d uploads %u last-check %d written-since %d",
                (unsigned long long)t->addr, t->mirrored, t->gpu_owned, t->bound, ups, last, wr);
             uint8_t ssw[4] = {0};
-            vk_texture_slot_swz(NVN_HANDLE_TEX(h), ssw);
+            vk_texture_slot_swz(&ex->tex_pool, NVN_HANDLE_TEX(h), ssw);
             sp(b, " | swz image %u%u%u%u slot %u%u%u%u", t->swz[0], t->swz[1], t->swz[2], t->swz[3], ssw[0], ssw[1], ssw[2],
                ssw[3]);
             if (hv && v.set_swizzle) sp(b, " view %u%u%u%u", v.swz[0], v.swz[1], v.swz[2], v.swz[3]);
@@ -797,7 +797,7 @@ void vk_dump_dispatch(VkExec *ex, const GfxShader *cs, VkPipeline p, const VkPip
         uint64_t h = handle_of(ex, 5, bd->res->slot, 1);
         view_t v;
         int hv = 0;
-        const VkTexImage *t = h ? vk_texture_by_id(NVN_HANDLE_TEX(h), &v, &hv) : NULL;
+        const VkTexImage *t = h ? vk_texture_by_id(&ex->tex_pool, NVN_HANDLE_TEX(h), &v, &hv) : NULL;
         if (!t) continue;
         uint32_t lv = hv && v.set_levels ? v.base_level : 0, layer = hv && v.set_layers ? v.min_layer : 0;
         if (lv >= t->levels || layer >= t->layers) continue;

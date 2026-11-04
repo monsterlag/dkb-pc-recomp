@@ -114,8 +114,8 @@ typedef struct {
     int  (*pool_init)(pool_t *p);                          // 0 fails MemoryPoolInitialize
     void (*pool_fini)(pool_t *p);
     int  (*pool_map_virtual)(pool_t *v, int n, const void *requests);   // NVNmappingRequest[n], 0x28 bytes each
-    void (*texture_register)(int id, const tex_t *t, const view_t *v);
-    void (*sampler_register)(int id, const samp_par *s);
+    void (*texture_register)(const dpool_ref *pool, int id, const tex_t *t, const view_t *v);
+    void (*sampler_register)(const dpool_ref *pool, int id, const samp_par *s);
     void (*texture_release)(const tex_t *t);
     void (*program_release)(const prog_t *p);
     // submitted_ticks is the front end's immutable entry tick, including 0; it is not GPU execution time.

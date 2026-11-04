@@ -630,7 +630,13 @@ static void parse_all(uint64_t h) {
         }
         case OP_BARRIER: CHECK(((const p_barrier *)a)->bits == 3, "BARRIER payload"); break;
         case OP_SET_TEX_POOL:
-        case OP_SET_SAMP_POOL: CHECK(((const p_set_pool *)a)->pool != NULL, "SET_*_POOL payload"); break;
+            CHECK(((const p_set_pool *)a)->pool.addr == U(pmem) + 0x30000 &&
+                  ((const p_set_pool *)a)->pool.count == 16, "SET_TEX_POOL captures table address and count");
+            break;
+        case OP_SET_SAMP_POOL:
+            CHECK(((const p_set_pool *)a)->pool.addr == U(pmem) + 0x31000 &&
+                  ((const p_set_pool *)a)->pool.count == 8, "SET_SAMP_POOL captures table address and count");
+            break;
         case OP_COPY_B2T: {
             const p_copy_b2t *p = a;
             CHECK(p->src == 0x9000 && p->tex && p->tex->serial == t1->serial && p->has_view && p->view.set_levels && p->view.base_level == 1 &&

@@ -40,8 +40,8 @@ static uint64_t fence;
 static int null_pool_init(pool_t *p) { (void)p; return 1; }
 static void null_pool_fini(pool_t *p) { (void)p; }
 static int null_pool_map_virtual(pool_t *v, int n, const void *requests) { (void)v, (void)n, (void)requests; return 1; }
-static void null_texture_register(int id, const tex_t *t, const view_t *v) { (void)id, (void)t, (void)v; }
-static void null_sampler_register(int id, const samp_par *s) { (void)id, (void)s; }
+static void null_texture_register(const dpool_ref *pool, int id, const tex_t *t, const view_t *v) { (void)pool, (void)id, (void)t, (void)v; }
+static void null_sampler_register(const dpool_ref *pool, int id, const samp_par *s) { (void)pool, (void)id, (void)s; }
 static void null_texture_release(const tex_t *t) { (void)t; }
 static void null_program_release(const prog_t *p) { (void)p; }
 

@@ -531,20 +531,21 @@ static int test_textures(pool_t *tpool, pool_t *phys) {
     if (read_back(&g, 0, gl, 0, "physical-pool RGBA8 WriteTexels")) return 1;
 
     // a slot of a finalized texture follows the live texture at the same storage (MNG hle_nvn.c)
-    vk_texture_register(5, &b, NULL);
+    dpool_ref descriptors = {.addr = (uintptr_t)tpool->mem + 0xf0000, .count = 6};
+    vk_texture_register(&descriptors, 5, &b, NULL);
     vk_texture_release(&b);
     tex_t b2 = make_tex(tpool, 0x40000, 0x25, 16, 12, 1, 4);
     const VkTexImage *live = vk_texture_get(&b2);
     VkImage live_img = live ? live->image : VK_NULL_HANDLE;
-    const VkTexImage *slot = vk_texture_by_id(5, NULL, NULL);
+    const VkTexImage *slot = vk_texture_by_id(&descriptors, 5, NULL, NULL);
     GCHECK(live && slot && slot->image == live_img, "slot 5 does not follow the live texture at its storage");
     samp_par sp;
     memset(&sp, 0, sizeof sp);
     sp.minf = NVN_MIN_FILTER_LINEAR_MIPMAP_LINEAR, sp.magf = NVN_MAG_FILTER_LINEAR, sp.ws = sp.wt = sp.wr = NVN_WRAP_MODE_REPEAT;
     sp.lod_max = 1000, sp.aniso = 16;
-    vk_sampler_register(0, &sp);
-    VkSampler s0 = vk_sampler_by_id(0), s1 = vk_sampler_for(&sp);
-    GCHECK(s0 && s0 == s1 && !vk_sampler_by_id(1), "sampler slots");
+    vk_sampler_register(&descriptors, 0, &sp);
+    VkSampler s0 = vk_sampler_by_id(&descriptors, 0), s1 = vk_sampler_for(&sp);
+    GCHECK(s0 && s0 == s1 && !vk_sampler_by_id(&descriptors, 1), "sampler slots");
     g_gpu_checks += 7;
     vk_texture_release(&t), vk_texture_release(&b2), vk_texture_release(&g);
     for (int i = 0; i < 4; i++) free(lin[i]), free(bl[i]);

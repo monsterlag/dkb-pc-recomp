@@ -21,27 +21,37 @@
 // ---------- Descriptor pools
 // NVNboolean nvnTexturePoolInitialize(NVNtexturePool *tp, const NVNmemoryPool *p, ptrdiff_t offset, int n)
 NVN_API(nvnTexturePoolInitialize) {
-    *(dpool_t *)arg_p(c, 0) = (dpool_t){arg_p(c, 1), (int64_t)arg_x(c, 2), (int32_t)arg_x(c, 3)};
+    dpool_t p = {arg_p(c, 1), (int64_t)arg_x(c, 2), (int32_t)arg_x(c, 3)};
+    dpool_ref ref;
+    int ok = nvn_dpool_snapshot(&p, 1u << 20, &ref);
+    *(dpool_t *)arg_p(c, 0) = ok ? p : (dpool_t){0};
     NVN_LOG("TexturePool n=%d", (int)arg_x(c, 3));
-    ret_x(c, 1);
+    ret_x(c, ok);
 }
 // void nvnTexturePoolFinalize(NVNtexturePool *tp)
-NVN_API(nvnTexturePoolFinalize) { (void)c; }
+NVN_API(nvnTexturePoolFinalize) { memset(arg_p(c, 0), 0, sizeof(dpool_t)); }
 // void nvnTexturePoolRegisterTexture(const NVNtexturePool *tp, int id, const NVNtexture *t, const NVNtextureView *v)
 NVN_API(nvnTexturePoolRegisterTexture) {
-    gfx_backend()->texture_register((int)arg_x(c, 1), arg_p(c, 2), arg_p(c, 3));
+    dpool_ref pool;
+    if (!nvn_dpool_snapshot(arg_p(c, 0), 1u << 20, &pool)) rt_fatal("nvn: invalid texture descriptor pool");
+    gfx_backend()->texture_register(&pool, (int)arg_x(c, 1), arg_p(c, 2), arg_p(c, 3));
 }
 // NVNboolean nvnSamplerPoolInitialize(NVNsamplerPool *sp, const NVNmemoryPool *p, ptrdiff_t offset, int n)
 NVN_API(nvnSamplerPoolInitialize) {
-    *(dpool_t *)arg_p(c, 0) = (dpool_t){arg_p(c, 1), (int64_t)arg_x(c, 2), (int32_t)arg_x(c, 3)};
+    dpool_t p = {arg_p(c, 1), (int64_t)arg_x(c, 2), (int32_t)arg_x(c, 3)};
+    dpool_ref ref;
+    int ok = nvn_dpool_snapshot(&p, 1u << 12, &ref);
+    *(dpool_t *)arg_p(c, 0) = ok ? p : (dpool_t){0};
     NVN_LOG("SamplerPool n=%d", (int)arg_x(c, 3));
-    ret_x(c, 1);
+    ret_x(c, ok);
 }
 // void nvnSamplerPoolFinalize(NVNsamplerPool *sp)
-NVN_API(nvnSamplerPoolFinalize) { (void)c; }
+NVN_API(nvnSamplerPoolFinalize) { memset(arg_p(c, 0), 0, sizeof(dpool_t)); }
 // void nvnSamplerPoolRegisterSampler(const NVNsamplerPool *sp, int id, const NVNsampler *s)
 NVN_API(nvnSamplerPoolRegisterSampler) {
-    gfx_backend()->sampler_register((int)arg_x(c, 1), &((const samp_t *)arg_p(c, 2))->p);
+    dpool_ref pool;
+    if (!nvn_dpool_snapshot(arg_p(c, 0), 1u << 12, &pool)) rt_fatal("nvn: invalid sampler descriptor pool");
+    gfx_backend()->sampler_register(&pool, (int)arg_x(c, 1), &((const samp_t *)arg_p(c, 2))->p);
 }
 
 // ---------- Texture builder

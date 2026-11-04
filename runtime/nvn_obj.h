@@ -41,6 +41,22 @@ typedef struct { uint32_t magic, flags; uint8_t *mem; uint64_t size; uint8_t *ga
 typedef struct { const pool_t *pool; int64_t off; int32_t n; } dpool_t;                       // Texture / sampler descriptor pool
 FITS(dpool_t, NVNtexturePool); FITS(dpool_t, NVNsamplerPool);
 
+// Descriptor table addressing captured by a command, independent of the descriptor-pool object's later lifetime.
+typedef struct { uint64_t addr; uint32_t count, pad; } dpool_ref;
+#define NVN_DESCRIPTOR_BYTES 32u   // DeviceGetInteger: texture and sampler descriptor sizes
+static inline int nvn_dpool_snapshot(const dpool_t *p, uint32_t limit, dpool_ref *out) {
+    memset(out, 0, sizeof *out);
+    if (!p) return 1;
+    if (!p->pool || p->pool->magic != MAGIC('P', 'O', 'O', 'L') || !p->pool->mem || p->off < 0 ||
+        p->n <= 0 || (uint32_t)p->n > limit) return 0;
+    uint64_t base = (uintptr_t)p->pool->mem, off = (uint64_t)p->off;
+    uint64_t bytes = (uint64_t)(uint32_t)p->n * NVN_DESCRIPTOR_BYTES;
+    if (off % NVN_DESCRIPTOR_BYTES || off > p->pool->size || bytes > p->pool->size - off ||
+        base > UINT64_MAX - off || base + off > UINT64_MAX - bytes || (base + off) % NVN_DESCRIPTOR_BYTES) return 0;
+    *out = (dpool_ref){base + off, (uint32_t)p->n, 0};
+    return 1;
+}
+
 typedef struct {
     NVNdevice *dev; nvn_texdesc d; pool_t *pool; int64_t off;
     uint8_t has_layout, layout[8];
@@ -150,7 +166,7 @@ typedef struct { float factor, units, clamp; } p_poly_offset;
 typedef struct { int32_t prim, first, count, base_instance, instances; } p_draw;   // TOTK: instances 0 = one instance (DrawArrays)
 typedef struct { int32_t prim, itype, count, base_vertex, base_instance, instances; uint64_t ibuf; } p_draw_idx;
 typedef struct { int32_t x, y, z; uint64_t caller; } p_dispatch;   // caller: return address of the game call site (to locate the dispatcher)
-typedef struct { const dpool_t *pool; } p_set_pool;
+typedef struct { dpool_ref pool; } p_set_pool;
 typedef struct { uint64_t src; const tex_t *tex; view_t view; uint8_t has_view; NVNcopyRegion r; int32_t flags; } p_copy_b2t;
 typedef struct { const tex_t *src, *dst; view_t sv, dv; uint8_t has_sv, has_dv; NVNcopyRegion sr, dr; int32_t flags; } p_copy_t2t;   // Reused for T2B: src stores the destination buffer address
 typedef struct { const tex_t *tex; view_t view; uint8_t has_view, is_uint; NVNcopyRegion r; int32_t mask; union { float f[4]; uint32_t u[4]; } c; } p_clear_tex;

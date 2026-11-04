@@ -35,6 +35,7 @@ typedef struct { struct PoolRec *phys; uint64_t off; } VPage;   // virtual page 
 
 typedef struct PoolRec {
     const pool_t *key;
+    uint64_t storage_serial;          // unique backing lifetime; virtual aliases use their physical record's serial
     int kind;
     uint32_t flags;
     uint64_t lo, size;                 // GPU address range of the pool
@@ -79,6 +80,7 @@ static PlatMutex pool_lock = PLAT_MUTEX_INIT;
 // Bumped under pool_lock (exclusive) by every change to the index or a page table: vk_mem_resolve's per-thread hits
 // stay valid while it is unchanged.
 static uint64_t pool_gen = 1;
+static uint64_t storage_serial;
 // Bumped when a buffer use may get another buffer for the same span (a mirror created, refused or forgotten) and at
 // every submission's start (mirror syncs are per submission). vk_mem_gen: both together.
 static uint64_t mirror_gen;
@@ -241,6 +243,13 @@ static void destroy_rec(VkCtx *c, PoolRec *r) {
 int vk_pool_init(pool_t *p) {
     VkCtx *c = vk_ctx();
     if (!c) { rt_log("vk: MemoryPoolInitialize before vk_init"); return 0; }
+    // Reinitializing the same object retires its old backing before installing the new mapping. In particular,
+    // descriptors at a reused address must not inherit registrations from a previous storage lifetime.
+    int reinit = 0;
+    plat_mutex_lock_shared(&pool_lock);
+    for (int i = 0; i < pool_index.n; i++) if (pool_index.e[i].key == p) { reinit = 1; break; }
+    plat_mutex_unlock_shared(&pool_lock);
+    if (reinit) vk_pool_fini(p);
     // The GPU never sees a GPU_NO_ACCESS pool, except a physical one (0x189; 1.4.3 also 0x18c, CPU-visible) through the
     // virtual pools that map it. Either gets device-local memory: 1.4.3's CPU never writes its 0x18c pool's storage
     // (unchanged over 3600 frames of the intro), so the guest storage and the GPU copy need no sync.
@@ -275,6 +284,8 @@ int vk_pool_init(pool_t *p) {
     }
     if (!ok) { free(r->pt); free(r); return 0; }
     plat_mutex_lock(&pool_lock);
+    if (!++storage_serial) ++storage_serial;
+    r->storage_serial = storage_serial;
     index_put(r);
     if (r->kind == POOL_PHYS) {
         if (nphys == cap_phys) {
@@ -309,6 +320,10 @@ void vk_pool_fini(pool_t *p) {
     }
     plat_mutex_unlock(&pool_lock);
     if (!r) return;
+    // Texture lock is acquired only after releasing pool_lock. Descriptor lookup takes them in the other direction
+    // (texture, then pool), just as normal image creation does. Imported aliases still alive preserve shared bytes.
+    if (r->kind == POOL_IMPORT) vk_texture_descriptors_retire(r->lo, r->size, 0);
+    else if (r->kind == POOL_PHYS) vk_texture_descriptors_retire(0, 0, r->storage_serial);
     if (r->smap) shadow_forget(r);
     if (r->kind == POOL_IMPORT) mem_thaw(r->lo, r->size);   // the storage goes back to the guest writable
     // Images cut from this range go first; a used buffer or memory waits until the GPU is done with it, since the
@@ -380,6 +395,37 @@ static int resolve_check_on(void) {
 }
 
 static int resolve_locked(uint64_t addr, uint64_t size, VkMemSpan *out);
+
+int vk_mem_descriptor_key(uint64_t addr, uint64_t size, VkDescKey *out) {
+    memset(out, 0, sizeof *out);
+    if (!addr || !size || addr > UINT64_MAX - size) return 0;
+    int ok = 0;
+    plat_mutex_lock_shared(&pool_lock);
+    const pidx_ent *e = pidx_find(&pool_index, addr, size);
+    const PoolRec *r = e ? e->buf : NULL;
+    if (r && r->kind == POOL_IMPORT) {
+        *out = (VkDescKey){0, addr};
+        ok = 1;
+    } else if (r && r->kind == POOL_PHYS) {
+        *out = (VkDescKey){r->storage_serial, addr - r->lo};
+        ok = 1;
+    } else if (r && r->kind == POOL_VIRT) {
+        uint64_t rel = addr - r->lo, k = rel / NVN_VPOOL_PAGE;
+        const PoolRec *ph = k < r->npages ? r->pt[k].phys : NULL;
+        if (ph) {
+            uint64_t off = r->pt[k].off + rel % NVN_VPOOL_PAGE;
+            uint64_t end = r->pt[k].off + NVN_VPOOL_PAGE;
+            for (uint64_t j = k + 1; end - off < size && j < r->npages && r->pt[j].phys == ph &&
+                 r->pt[j].off == end; j++) end += NVN_VPOOL_PAGE;
+            if (end - off >= size && off <= ph->size && size <= ph->size - off) {
+                *out = (VkDescKey){ph->storage_serial, off};
+                ok = 1;
+            }
+        }
+    }
+    plat_mutex_unlock_shared(&pool_lock);
+    return ok;
+}
 
 int vk_mem_resolve(uint64_t addr, uint64_t size, VkMemSpan *out) {
     memset(out, 0, sizeof *out);
