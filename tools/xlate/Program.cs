@@ -6,10 +6,12 @@
 //   totk_xlate --serve              one request per stdin line: {"job": {...}, "out": "<dir>"}; one reply line per request:
 //                                   "ok <key>" or "fail <key> <message>"; a malformed line gets "fail ? <message>" and the loop continues.
 //   totk_xlate <jobs.json> <outdir> batch mode: a JSON array of jobs, prints a summary, exit 1 if any failed.
-//   job: { "key", "stage": "vs|ps|cs", "code": path (graphics = 0x50-byte SPH + instructions, compute = instructions), "c1": hex,
+//   job: { "key", "stage": "vs|gs|ps|cs", "code": path (graphics = 0x50-byte SPH + instructions, compute = instructions), "c1": hex,
 //          "tex": {slot: type}, "img": {slot: {type, fmt}}, "attr": {loc: float|sint|uint}, "fout": {idx: float|sint|uint},
 //          "local": [x, y, z], "shared": bytes, "debug": bool, "reduced": bool, "softfloat64": bool,
 //          "sbuf_align": int, "subgroup": int }
+//   GS additionally requires "geometry_version": 1 and "gs_input": "points|lines|lines_adjacency|triangles|triangles_adjacency".
+//   These fields are rejected on other stages. Passthrough GS requires downstream varying linkage and is unsupported.
 //   Output: <out>/<key>.spv and <out>/<key>.res.json (bindings, queried slots, notes).
 using Ryujinx.Common.Memory;
 using Ryujinx.Graphics.Shader;
@@ -32,17 +34,64 @@ static class SwshXlate
         readonly byte[] _c1;
         readonly int _rootBytes;
         public int StorageCandidatesVersion { get; }
+        public int GeometryVersion { get; }
+        public string GeometryInputName { get; }
+        public InputTopology GeometryInput { get; } = InputTopology.Triangles;
+        public int GeometryInputVertices { get; }
+        public string GeometryOutputName { get; }
         public Accessor(byte[] code, JsonObject job)
         {
             _code = code; _job = job; _c1 = job["c1"] is JsonNode h ? Convert.FromHexString((string)h) : Array.Empty<byte>();
-            if (job.TryGetPropertyValue("storage_candidates_version", out JsonNode version))
+            if (job.TryGetPropertyValue("storage_candidates_version", out JsonNode storageVersion))
             {
-                if (version is not JsonValue value || !value.TryGetValue<int>(out int parsed) || parsed is not (0 or 1))
+                if (storageVersion is not JsonValue value || !value.TryGetValue<int>(out int parsed) || parsed is not (0 or 1))
                     throw new InvalidDataException("unsupported storage_candidates_version; expected integer 0 or 1");
                 StorageCandidatesVersion = parsed;
             }
             if (StorageCandidatesVersion == 1 && ((string)job["stage"] != "cs" || job["c0"] is not JsonArray))
                 throw new InvalidDataException("storage candidates v1 requires NVN 2 compute root layout version 2");
+            if ((string)job["stage"] == "gs")
+            {
+                if (job["geometry_version"] is not JsonValue version || !version.TryGetValue<int>(out int v) || v != 1)
+                    throw new InvalidDataException("GS requires geometry_version integer 1");
+                if (job["gs_input"] is not JsonValue input || !input.TryGetValue<string>(out string name))
+                    throw new InvalidDataException("GS requires a supported gs_input topology");
+                (GeometryInput, GeometryInputVertices) = name switch
+                {
+                    "points" => (InputTopology.Points, 1),
+                    "lines" => (InputTopology.Lines, 2),
+                    "lines_adjacency" => (InputTopology.LinesAdjacency, 4),
+                    "triangles" => (InputTopology.Triangles, 3),
+                    "triangles_adjacency" => (InputTopology.TrianglesAdjacency, 6),
+                    _ => throw new InvalidDataException("Unsupported GS input topology: " + name),
+                };
+                if (code.Length < 0x60 || code.Length % 8 != 0)
+                    throw new InvalidDataException("GS requires a complete 0x50-byte SPH and instructions");
+                uint word0 = BitConverter.ToUInt32(code, 0);
+                if (((word0 >> 10) & 15) != (uint)ShaderStage.Geometry)
+                    throw new InvalidDataException("GS request requires a geometry SPH stage");
+                // The standalone service does not receive the next stage's varying requirements. Letting Ryujinx
+                // emulate passthrough here would silently omit those varyings; the NV extension is not contracted either.
+                if ((word0 & (1u << 24)) != 0)
+                    throw new NotSupportedException("Passthrough GS requires explicit downstream varying linkage");
+                if ((BitConverter.ToUInt32(code, 8) >> 24) == 0 || (BitConverter.ToUInt32(code, 16) & 0xfff) == 0)
+                    throw new InvalidDataException("GS requires nonzero invocation and output vertex counts");
+                GeometryOutputName = ((BitConverter.ToUInt32(code, 12) >> 24) & 15) switch
+                {
+                    1 => "points", 6 => "line_strip", 7 => "triangle_strip",
+                    _ => throw new InvalidDataException("Unsupported GS output topology"),
+                };
+                GeometryVersion = v;
+                GeometryInputName = name;
+            }
+            else
+            {
+                if (job.ContainsKey("geometry_version") || job.ContainsKey("gs_input"))
+                    throw new InvalidDataException("Geometry fields require the GS stage");
+                if ((string)job["stage"] != "cs" && code.Length >= 0x50 &&
+                    ((BitConverter.ToUInt32(code, 0) >> 10) & 15) == (uint)ShaderStage.Geometry)
+                    throw new InvalidDataException("Geometry SPH requires the GS request contract");
+            }
             if (job["c0"] != null)
             {
                 if (job["c0_version"]?.GetValue<int>() != 2 || job["c0"] is not JsonArray counts || counts.Count != 4 ||
@@ -131,11 +180,12 @@ static class SwshXlate
             // "early_fragment_tests": the fragment shader's NVN control byte +0x718 (the driver's early-Z-force, Ryujinx's
             // EarlyZForce); the SPIR-V then declares EarlyFragmentTests (MacNativeGames ae8f4f4).
             bool earlyZ = _job["early_fragment_tests"] is JsonValue ez && ez.TryGetValue<bool>(out bool eb) && eb;
-            return new GpuGraphicsState(earlyZ, InputTopology.Triangles, false, TessPatchType.Triangles, TessSpacing.EqualSpacing,
+            return new GpuGraphicsState(earlyZ, GeometryInput, false, TessPatchType.Triangles, TessSpacing.EqualSpacing,
                 false, false, false, depthMinusW, false, 1f, AlphaTestOp.Always, 0f, attr, false, fout, false,
                 false /* 不做 Y 取反 | no Y flip */, true /* 原点左上 | origin upper-left */, false);
         }
         public bool QueryHostSupportsDepthClipControl() => true;
+        public bool QueryHostSupportsGeometryShaderPassthrough() => false;
         // Vulkan: the ConstOffset / ConstOffsets image operands Ryujinx emits must be constants. A TLD4.PTP whose offsets
         // come from registers (agl_technique_pfx compute b940aa86, dfe7662f) otherwise becomes an OpConstantComposite over
         // computed ids, which spirv-val rejects; false makes TexturePass emulate only non-constant offsets.
@@ -175,6 +225,8 @@ static class SwshXlate
                 var flags = (job["debug"] is JsonNode dbg && !(bool)dbg ? 0 : TranslationFlags.DebugMode) | ((string)job["stage"] == "cs" ? TranslationFlags.Compute : 0);
                 var ctx = Translator.CreateContext(0, acc, new TranslationOptions(TargetLanguage.Spirv, TargetApi.Vulkan, flags));
                 ShaderProgram p = ctx.Translate();
+                if (acc.GeometryVersion != 0 && p.Info.Stage != ShaderStage.Geometry)
+                    throw new InvalidDataException("Geometry translation produced a different stage");
                 File.WriteAllBytes(Path.Combine(outDir, key + ".spv"), p.BinaryCode);
                 var res = new JsonObject
                 {
@@ -184,6 +236,17 @@ static class SwshXlate
                     ["storage_candidates_version"] = acc.StorageCandidatesVersion,
                     ["tex_queried"] = new JsonArray(acc.TexQueried.Select(x => (JsonNode)x).ToArray()), ["img_queried"] = new JsonArray(acc.ImgQueried.Select(x => (JsonNode)x).ToArray()),
                 };
+                if (acc.GeometryVersion != 0)
+                {
+                    res["geometry_version"] = acc.GeometryVersion;
+                    res["gs_input"] = acc.GeometryInputName;
+                    res["geometry"] = new JsonObject
+                    {
+                        ["input_vertices"] = acc.GeometryInputVertices, ["output_topology"] = acc.GeometryOutputName,
+                        ["invocations"] = p.Info.ThreadsPerInputPrimitive, ["max_output_vertices"] = p.Info.GeometryMaxOutputVertices,
+                        ["passthrough"] = false,
+                    };
+                }
                 foreach (var b in p.Info.CBuffers) res["cbufs"].AsArray().Add((JsonNode)new JsonObject { ["binding"] = b.Binding, ["slot"] = b.Slot });
                 foreach (var b in p.Info.SBuffers) res["sbufs"].AsArray().Add((JsonNode)new JsonObject { ["binding"] = b.Binding, ["slot"] = b.Slot, ["cb_slot"] = b.SbCbSlot, ["cb_offset"] = b.SbCbOffset, ["flags"] = (int)b.Flags });
                 foreach (var (list, name) in new[] { (p.Info.Textures, "textures"), (p.Info.Images, "images") })
