@@ -18,9 +18,12 @@ static unsigned checks, failures, normal_calls, config_calls, thread_calls, even
 static int on, race_mode;
 static uint64_t total_seen, total_emitted, total_dropped;
 static unsigned overflow;
+static unsigned config_int_calls, clock_calls, window_count, window_start, window_duration;
+static int configured_start, configured_duration;
+static uint64_t fake_clock=1000000000, window_elapsed, window_before, window_after;
 static uint64_t kind_seen[NVN_MODE_EVENT_COUNT], kind_emitted[NVN_MODE_EVENT_COUNT], kind_dropped[NVN_MODE_EVENT_COUNT];
 static const char *const kind_names[]={"initialize","finalize","begin","end","recording_mode","geometry_mode","prepare","handle"};
-typedef struct { uint64_t sequence, cb, handle, submit; unsigned thread, value, kind; } Captured;
+typedef struct { uint64_t sequence, cb, handle, submit, elapsed; unsigned thread, value, kind; } Captured;
 static Captured captured[NVN_MODE_TRACE_LIMIT];
 static HANDLE start_event, writer_inside, writer_release, flush_waiting;
 static DWORD writer_tid, flush_tid;
@@ -37,9 +40,13 @@ void rt_log(const char *format,...) {
     char text[512],name[32];va_list args;va_start(args,format);vsnprintf(text,sizeof text,format,args);va_end(args);
     if(!strncmp(text,"nvn2-mode event ",16)) {
         if(event_count>=NVN_MODE_TRACE_LIMIT)abort();Captured *e=&captured[event_count++];
-        if(sscanf(text,"nvn2-mode event seq=%llu type=%31s thread=%u cb=%llx handle=%llx value=%u submit=%llu",
-                  &e->sequence,name,&e->thread,&e->cb,&e->handle,&e->value,&e->submit)!=7)abort();
+        if(sscanf(text,"nvn2-mode event seq=%llu type=%31s thread=%u cb=%llx handle=%llx value=%u submit=%llu elapsed_ns=%llu",
+                  &e->sequence,name,&e->thread,&e->cb,&e->handle,&e->value,&e->submit,&e->elapsed)!=8)abort();
         e->kind=kind(name);
+    } else if(!strncmp(text,"nvn2-mode window ",17)) {
+        if(sscanf(text,"nvn2-mode window schema=2 origin=first_hook start_ms=%u duration_ms=%u elapsed_ns=%llu excluded_before=%llu excluded_after=%llu",
+                  &window_start,&window_duration,&window_elapsed,&window_before,&window_after)!=5)abort();
+        window_count++;
     } else if(!strncmp(text,"nvn2-mode capture ",18)) {
         unsigned limit;
         if(sscanf(text,"nvn2-mode capture seen=%llu emitted=%llu dropped=%llu limit=%u overflow=%u",
@@ -54,6 +61,16 @@ void rt_fatal(const char *format,...) {(void)format;abort();}
 void nvn_called(uint8_t *seen,const char *name) {(void)seen;(void)name;__atomic_fetch_add(&normal_calls,1,__ATOMIC_RELAXED);}
 int cfg_bool(const char *name) {
     if(strcmp(name,"TOTK_NVN2_MODE_TRACE"))abort();__atomic_fetch_add(&config_calls,1,__ATOMIC_RELAXED);return on;
+}
+int cfg_int(const char *name) {
+    __atomic_fetch_add(&config_int_calls,1,__ATOMIC_RELAXED);
+    if(!strcmp(name,"TOTK_NVN2_MODE_TRACE_START_MS"))return configured_start;
+    if(!strcmp(name,"TOTK_NVN2_MODE_TRACE_DURATION_MS"))return configured_duration;
+    abort();
+}
+uint64_t plat_now_ns(void) {
+    __atomic_fetch_add(&clock_calls,1,__ATOMIC_RELAXED);
+    return __atomic_load_n(&fake_clock,__ATOMIC_RELAXED);
 }
 void plat_once(PlatOnce *o,void(*fn)(void*),void *arg) {
     int32_t expected=0;
@@ -110,7 +127,43 @@ static DWORD WINAPI race_flush(void *arg) {
 }
 int main(int argc,char **argv) {
     if(argc!=2)return 2;on=strcmp(argv[1],"off")!=0;race_mode=!strcmp(argv[1],"race");
-    if(race_mode) {
+    int window_case=!strcmp(argv[1],"window")||!strcmp(argv[1],"empty")||
+        !strcmp(argv[1],"open")||!strcmp(argv[1],"max")||!strcmp(argv[1],"bad-start")||!strcmp(argv[1],"bad-duration");
+    if(window_case) {
+        configured_start=100;configured_duration=5;
+        if(!strcmp(argv[1],"bad-start"))configured_start=-1;
+        if(!strcmp(argv[1],"bad-duration"))configured_duration=600001;
+        if(!strcmp(argv[1],"open"))configured_duration=0;
+        if(!strcmp(argv[1],"max"))configured_start=configured_duration=600000;
+        nvn_mode_trace(NVN_MODE_RECORDING,1,0,0,0); // origin, excluded before start
+        if(configured_start<0||configured_duration>600000) {
+            nvn_mode_trace_finish();CHECK(!clock_calls&&!event_count&&!window_count&&!summary_count);
+        } else if(!strcmp(argv[1],"empty")) {
+            fake_clock+=20000000;nvn_mode_trace(NVN_MODE_RECORDING,1,0,0,0);
+            fake_clock=1050000000;nvn_mode_trace_finish();
+            CHECK(!total_seen&&!event_count&&window_before==2&&!window_after&&window_elapsed==50000000);
+        } else if(!strcmp(argv[1],"max")) {
+            fake_clock+=UINT64_C(600000000000);nvn_mode_trace(NVN_MODE_GEOMETRY,1,0,1,0);
+            nvn_mode_trace_finish();CHECK(total_seen==1&&event_count==1&&window_before==1&&!window_after);
+            CHECK(window_start==600000&&window_duration==600000&&captured[0].elapsed==600000000000);
+        } else if(!strcmp(argv[1],"open")) {
+            fake_clock=1100000000;nvn_mode_trace(NVN_MODE_GEOMETRY,1,0,1,0);
+            fake_clock=UINT64_C(701000000000);nvn_mode_trace(NVN_MODE_GEOMETRY,1,0,2,0);
+            nvn_mode_trace_finish();CHECK(total_seen==2&&window_before==1&&!window_after&&window_duration==0);
+        } else {
+            fake_clock=1099000000;nvn_mode_trace(NVN_MODE_RECORDING,1,0,0,0);
+            fake_clock=1100000000;nvn_mode_trace(NVN_MODE_RECORDING,1,0,1,0);
+            fake_clock=1104999999;nvn_mode_trace(NVN_MODE_GEOMETRY,1,0,2,0);
+            fake_clock=1105000000;nvn_mode_trace(NVN_MODE_GEOMETRY,1,0,3,0);
+            fake_clock=1106000000;nvn_mode_trace(NVN_MODE_GEOMETRY,1,0,4,0);
+            fake_clock=1200000000;nvn_mode_trace_finish();
+            CHECK(total_seen==2&&event_count==2&&!total_dropped&&window_before==2&&window_after==2);
+            CHECK(captured[0].value==1&&captured[0].elapsed==100000000&&captured[0].sequence==1);
+            CHECK(captured[1].value==2&&captured[1].elapsed==104999999&&captured[1].sequence==2);
+            CHECK(window_elapsed==200000000&&kind_seen[NVN_MODE_RECORDING]==1&&kind_seen[NVN_MODE_GEOMETRY]==1);
+        }
+        CHECK(config_calls==1&&config_int_calls==2&&!normal_calls);
+    } else if(race_mode) {
         writer_inside=CreateEvent(NULL,TRUE,FALSE,NULL);writer_release=CreateEvent(NULL,TRUE,FALSE,NULL);
         flush_waiting=CreateEvent(NULL,TRUE,FALSE,NULL);
         HANDLE w=CreateThread(NULL,0,race_writer,NULL,0,NULL);
@@ -120,7 +173,7 @@ int main(int argc,char **argv) {
         SetEvent(writer_release);join(w);join(f);
         CHECK(event_count==1&&captured[0].value==7&&captured[0].sequence==1);
         CHECK(total_seen==1&&total_emitted==1&&!total_dropped);
-        CHECK(summary_count==NVN_MODE_EVENT_COUNT&&profile_flushes==1);
+        CHECK(summary_count==NVN_MODE_EVENT_COUNT&&profile_flushes==1&&window_count==1&&clock_calls==3);
         nvn_mode_trace(NVN_MODE_RECORDING,456,0,9,0);nvn_mode_trace_finish();
         CHECK(event_count==1&&summary_count==NVN_MODE_EVENT_COUNT&&config_calls==1);
         CloseHandle(writer_inside);CloseHandle(writer_release);CloseHandle(flush_waiting);
@@ -152,8 +205,9 @@ int main(int argc,char **argv) {
             CHECK(nvn_handle_live(handles[i]));
         }
         prof_write();CHECK(config_calls==1&&normal_calls==80016&&profile_flushes==1);
-        if(!on)CHECK(!event_count&&!summary_count&&!thread_calls);
+        if(!on)CHECK(!event_count&&!summary_count&&!thread_calls&&!clock_calls&&!config_int_calls);
         else {
+            CHECK(window_count==1&&!window_start&&!window_duration&&!window_before&&!window_after&&config_int_calls==2);
             CHECK(event_count==NVN_MODE_TRACE_LIMIT&&total_seen==80022&&total_emitted==event_count);
             CHECK(total_dropped==total_seen-total_emitted&&overflow&&summary_count==NVN_MODE_EVENT_COUNT);
             const uint64_t expected[]={2,2,2,2,6,80002,3,3};unsigned ends=0,linked=0,modes=0;

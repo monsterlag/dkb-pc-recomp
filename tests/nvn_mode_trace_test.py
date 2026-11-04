@@ -43,7 +43,7 @@ def main():
         (out / f'compile-o{opt}.log').write_text(compiled.stdout + compiled.stderr)
         if compiled.returncode:
             raise RuntimeError(compiled.stderr)
-        for mode in ('off', 'on', 'race'):
+        for mode in ('off', 'on', 'race', 'window', 'empty', 'open', 'max', 'bad-start', 'bad-duration'):
             result = subprocess.run([str(exe), mode], capture_output=True, text=True, timeout=30)
             (out / f'{mode}-o{opt}.log').write_text(result.stdout + result.stderr)
             rows.append({'optimization': opt, 'mode': mode, 'exit': result.returncode, 'output': result.stdout.strip()})
