@@ -149,14 +149,19 @@ int main(int argc, char **argv) {
         printf("{\"accepted\":%s,\"status\":%d,\"skip\":[",packed?"true":"false",read);
         for(unsigned i=0;i<8;i++)printf("%s%u",i?",":"",got[i]);puts("]}");free(code);free(control);return 0;
     }
-    if (!strcmp(argv[1], "seed-pass") || !strcmp(argv[1], "record-pass")) {
+    if (!strcmp(argv[1], "seed-pass") || !strcmp(argv[1], "record-pass") || !strcmp(argv[1], "seed-lowered")) {
         if(argc!=7)return 2;
         uint64_t cn=0,nn=0,sn=0,rn=0;uint8_t *code=read_file(argv[3],&cn),*control=read_file(argv[4],&nn);
         GfxShader *s=calloc(1,sizeof *s);s->spirv=(uint32_t *)read_file(argv[5],&sn);s->reflection=(char *)read_file(argv[6],&rn);
         s->words=sn/4;s->reflection_size=rn;
+        int lowered=!strcmp(argv[1],"seed-lowered");
+        uint32_t skip[8];
+        if(lowered && (!code||!control||nn!=CONTROL_SIZE||
+           nvn_geometry_control_get(control,nn,code,cn,skip)!=1||
+           !nvn_geometry_control_pack_lowered(control,nn,code,cn,skip)))return 3;
         GfxShaderAnswers a;answers(&a,4);Req req={0};
         if(!code||!control||nn!=CONTROL_SIZE||!s->spirv||sn%4||!s->reflection||
-           !reflect(s,0)||!req_init(&req,3,control,code,cn,NULL,&a)) {puts("{\"accepted\":false}");shader_free(s);free(code);free(control);return 0;}
+           !reflect(s,lowered?REFLECT_LOWERED_BODY:0)||!req_init(&req,3,control,code,cn,NULL,&a)) {puts("{\"accepted\":false}");shader_free(s);free(code);free(control);return 0;}
         UseMask use=use_of(s);use_store(req.code_hash,&use);
         if(!req_init(&req,3,control,code,cn,NULL,&a))return 4;
         memcpy(s->key,req.key,32);memcpy(s->iid,req.iid,32);
@@ -164,6 +169,7 @@ int main(int argc, char **argv) {
         snprintf(path,sizeof path,"%s/%s.spv",cache_dir,hex);if(!write_file(path,s->spirv,(size_t)sn))return 4;
         snprintf(path,sizeof path,"%s/%s.res.json",cache_dir,hex);if(!write_file(path,s->reflection,(size_t)rn))return 4;
         in_store(req.iid,3,control,code,&req,&a);
+        if(lowered && !write_file(argv[4],control,(size_t)nn))return 4;
         if(!strcmp(argv[1],"record-pass")) {
             char keys[PATH_CAP+40];snprintf(keys,sizeof keys,"%s/pipeline-keys.bin",cache_dir);
             gfx_shader_record_at(keys);ans_note(&req,3,control,code,&a,s);gfx_shader_record_flush(1);
