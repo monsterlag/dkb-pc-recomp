@@ -527,13 +527,46 @@ static void accumulate(Mixer *m, int buffer, const float *src, float vol, int fr
     float *d = mixbuf(m, buffer); for (int k = 0; k < frames; k++) d[k] += src[k] * vol;
 }
 static int mix_valid(AudioRenderer *r, int32_t id) { return id >= 0 && id <= r->param.submix_count && r->mixes[id].in_use; }
-static int mix_depth(AudioRenderer *r, int id) {
-    int d = 0;
-    for (int guard = 0; id > 0 && guard < 64; guard++, d++) {
-        if (!mix_valid(r, r->mixes[id].dest_mix_id)) return d + 1;
-        id = r->mixes[id].dest_mix_id;
+static void mix_order_edge(AudioRenderer *r, int source, int destination, uint32_t edges[256][8],
+                           uint16_t incoming[256]) {
+    if (destination <= 0 || !mix_valid(r, destination)) return; // final mix is processed separately, last
+    uint32_t bit = 1u << (destination & 31);
+    if (!(edges[source][destination >> 5] & bit)) {
+        edges[source][destination >> 5] |= bit;
+        incoming[destination]++;
     }
-    return d;
+}
+static int mix_order(AudioRenderer *r, int order[256]) {
+    const int count = r->param.submix_count + 1;
+    if (count < 1 || count > 256) rt_fatal("audio submix routing count");
+    Mixer *m = r->mixer;
+    uint32_t edges[256][8] = {{0}};
+    uint16_t incoming[256] = {0};
+    int active = 0, n = 0;
+    // Match the effective routes below, including a valid splitter with no live
+    // destination. Eglantine audio_core/renderer/mix/mix_info.cpp::MixInfo::UpdateConnection
+    // and audio_core/renderer/mix/mix_context.cpp::MixContext::TSortInfo likewise include
+    // splitter destinations in the mix dependency graph.
+    for (int i = 1; i < count; i++) if (r->mixes[i].in_use) {
+        active++;
+        const AudrenMixIn *x = &r->mixes[i];
+        if (x->dest_splitter_id != SPLITTER_UNUSED && x->dest_splitter_id < (uint32_t)m->nsplit) {
+            const SplitInfo *s = &m->split[x->dest_splitter_id];
+            for (int k = 0; k < s->ndest; k++) {
+                const SplitDest *d = &m->dest[s->ids[k]];
+                if (d->used) mix_order_edge(r, i, d->dest, edges, incoming);
+            }
+        } else mix_order_edge(r, i, x->dest_mix_id, edges, incoming);
+    }
+    for (int i = 1; i < count; i++) if (r->mixes[i].in_use && !incoming[i]) order[n++] = i;
+    for (int at = 0; at < n; at++) {
+        int source = order[at];
+        for (int destination = 1; destination < count; destination++)
+            if ((edges[source][destination >> 5] & (1u << (destination & 31))) && !--incoming[destination])
+                order[n++] = destination;
+    }
+    if (n != active) rt_fatal("audio submix routing cycle");
+    return n;
 }
 
 /* Guest custom effects exchange int32 samples in two rings. Each ring has CPU and DSP
@@ -765,10 +798,8 @@ void audio_mixer_render(AudioRenderer *r, double seconds) {
             }
         }
     }
-    /* submixes: deepest first, so every mix is complete before it is folded into its destination */
-    int order[256], n = 0, depth[256];
-    for (int i = 1; i < mc && n < 256; i++) if (r->mixes[i].in_use) { depth[n] = mix_depth(r, i); order[n++] = i; }
-    for (int a = 0; a < n; a++) for (int b = a + 1; b < n; b++) if (depth[b] > depth[a]) { int t = order[a]; order[a] = order[b]; order[b] = t; t = depth[a]; depth[a] = depth[b]; depth[b] = t; }
+    /* Every direct or splitter-fed source precedes its destination submix. */
+    int order[256], n = mix_order(r, order);
     for (int a = 0; a < n; a++) {
         mix_effects(r, order[a]);
         const AudrenMixIn *x = &r->mixes[order[a]]; int src = m->offset[order[a]];
