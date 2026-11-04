@@ -42,6 +42,12 @@ void rt_fatal(const char *fmt, ...) { (void)fmt; abort(); }
 static void warn_once(int id, const char *fmt, ...) { (void)id; (void)fmt; }
 void vk_mem_count(int cls, int use, uint64_t bytes) { (void)cls; (void)use; (void)bytes; }
 static void count_use(int cls, int use, uint64_t bytes) { vk_mem_count(cls, use, bytes); }
+// Profiling is disabled in this CPU fixture; reaching either profiling-only hook is an unexpected dependency.
+int vk_sync_noting(void) { return 0; }
+uint64_t nvn2_origin(const uint8_t *code) { (void)code; abort(); }
+void vk_sync_note_write(uint64_t addr, uint64_t size, uint64_t stage) {
+    (void)addr; (void)size; (void)stage; abort();
+}
 void vk_mem_use(VkMemSpan *span) { (void)span; }
 void vk_mem_bound_note(void *pool) { (void)pool; }
 void vk_mem_gpu_wrote(const VkMemSpan *span, uint64_t n) { (void)span; (void)n; wrote++; }
