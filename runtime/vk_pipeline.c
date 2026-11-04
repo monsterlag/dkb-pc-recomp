@@ -83,6 +83,8 @@ static struct {
     int f_geometry, f_vertex_stores, f_gs_point_size, f_clip, f_cull;
     int pv_last;                       // provokingVertexLast enabled: NVN's default is the last vertex
     VkShaderStageFlags sg32_stages;    // stages that accept requiredSubgroupSize = 32 (0: not available)
+    VkShaderStageFlags subgroup_stages;
+    VkSubgroupFeatureFlags subgroup_operations;
     VkDynamicState dyn[32];
     uint32_t n_dyn;
     PFN_vkCmdPushDescriptorSetKHR push;
@@ -229,6 +231,11 @@ static int ensure_init(void) {
                                             .pNext = c->has_provoking_vertex ? (void *)&pvf : (c->has_eds3 ? (void *)&e3 : NULL)};
     VkPhysicalDeviceFeatures2 f2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &v13};
     vkGetPhysicalDeviceFeatures2(c->phys, &f2);
+    VkPhysicalDeviceSubgroupProperties subgroup = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+    VkPhysicalDeviceProperties2 subgroup_properties = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &subgroup};
+    vkGetPhysicalDeviceProperties2(c->phys, &subgroup_properties);
+    P.subgroup_stages = subgroup.supportedStages;
+    P.subgroup_operations = subgroup.supportedOperations;
     P.pv_last = c->has_provoking_vertex && pvf.provokingVertexLast;
     if (!P.pv_last) rt_log("vk_pipeline: provokingVertexLast unavailable: flat outputs come from the first vertex (NVN: last)");
     // Maxwell warps have 32 lanes; the translator assumes it (maxwell.md 3.4). Pin 32 where the driver allows it.
@@ -1001,7 +1008,113 @@ typedef struct {
     uint64_t builtin_mask, builtin[64];
     uint64_t standalone_builtins;
     uint8_t block_members, block_invariant, block_builtin[16];
+    uint8_t system_inputs; // bit 0: subgroup lane ID, bit 1: subgroup less-than mask; neither is VS-linked
 } GeometryInterface;
+
+// These standalone GS inputs are supplied by the implementation, not the VS.
+// Match the exact U32 forms emitted by Ryujinx IoMap, without putting large
+// BuiltIn IDs into the per-vertex 64-bit mask or consuming vertex components.
+static int geometry_system_input(const GeometryId *id, uint32_t bound, const GeometryId *var,
+                                 uint32_t type, uint8_t *seen) {
+    uint32_t builtin = var->builtin - 1;
+    uint8_t bit = builtin == 41 ? 1 : builtin == 4420 ? 2 : 0;
+    if (!bit || (*seen & bit) || var->location || var->component || var->invariant ||
+        var->interpolation || var->unsupported || var->block || !type || type >= bound) return 0;
+    if (bit == 2) {
+        if (id[type].op != 23 || id[type].y != 4) return 0;
+        type = id[type].x;
+        if (!type || type >= bound) return 0;
+    }
+    if (id[type].op != 21 || id[type].x != 32 || id[type].y) return 0;
+    *seen |= bit;
+    return 1;
+}
+
+// Reject known subgroup extension families without rejecting unrelated shader
+// extensions. The literal must terminate within its instruction, with zero pad.
+static int geometry_subgroup_extension(const uint32_t *words, uint32_t count) {
+    if (!count) return 0;
+    const char *name = (const char *)words;
+    size_t bytes = (size_t)count * 4;
+    const char *end = memchr(name, 0, bytes);
+    if (!end || end == name) return 0;
+    for (const char *p = end + 1; p < name + bytes; p++) if (*p) return 0;
+    static const char *tokens[] = {"subgroup", "sub_group", "group_non_uniform", "shader_ballot"};
+    for (unsigned t = 0; t < sizeof tokens / sizeof *tokens; t++) {
+        size_t length = strlen(tokens[t]);
+        for (const char *p = name; (size_t)(end - p) >= length; p++) {
+            size_t i;
+            for (i = 0; i < length; i++) {
+                unsigned char c = (unsigned char)p[i];
+                if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+                if (c != (unsigned char)tokens[t][i]) break;
+            }
+            if (i == length) return 0;
+        }
+    }
+    return 1;
+}
+
+// Capability support applies even without an instruction; stage support is a
+// separate requirement for actual subgroup-scoped group operations (Vulkan
+// SPIR-V appendix, VUID-RuntimeSpirv-None-06343). The required-size pin is not
+// evidence for either. Admit only the group families currently emitted here.
+static int geometry_subgroups(const GfxShader *s, uint8_t system_inputs) {
+    uint64_t words = 0;
+    const uint32_t *w = gfx_shader_spirv(s, &words);
+    if (!w || words < 5 || !w[3] || w[3] > (1u << 16)) return 0;
+    uint32_t bound = w[3], declared = 0, operations = 0;
+    GeometryId *id = calloc(bound, sizeof *id);
+    int ok = 0;
+    if (!id) return 0;
+    for (uint64_t i = 5; i < words;) {
+        uint32_t n = w[i] >> 16, op = w[i] & 0xffff;
+        if (!n || n > words - i) goto done;
+        const uint32_t *a = w + i + 1;
+        if (op == 17) {
+            if (n != 2) goto done;
+            if (a[0] >= 61 && a[0] <= 68) declared |= 1u << (a[0] - 61);
+            else if (a[0] == 58 || a[0] == 4423 || a[0] == 4431 || a[0] == 5297 ||
+                     (a[0] >= 5568 && a[0] <= 5570) || a[0] == 5579 ||
+                     (a[0] >= 5696 && a[0] <= 5698)) goto done;
+        } else if (op == 10) {
+            if (!geometry_subgroup_extension(a, n - 1)) goto done;
+        } else if (op == 21 && n == 4 && a[0] < bound) {
+            id[a[0]].op = op; id[a[0]].x = a[1]; id[a[0]].y = a[2];
+        } else if (op == 43 && n == 4 && a[1] < bound) {
+            id[a[1]].op = op; id[a[1]].type = a[0]; id[a[1]].x = a[2];
+        } else if (op >= 333 && op <= 366) {
+            if (n < 5 || op == 333 || op > 348 || !a[2] || a[2] >= bound) goto done;
+            uint32_t expected = (op <= 336 || op == 338 || op == 339 || op == 340 || op == 343 || op == 344) ? 5 : 6;
+            if (n != expected) goto done;
+            const GeometryId *scope = &id[a[2]];
+            if (scope->op != 43 || scope->x != 3 || !scope->type || scope->type >= bound ||
+                id[scope->type].op != 21 || id[scope->type].x != 32 || id[scope->type].y) goto done;
+            operations |= op <= 336 ? VK_SUBGROUP_FEATURE_VOTE_BIT :
+                op <= 344 ? VK_SUBGROUP_FEATURE_BALLOT_BIT : op <= 346 ? VK_SUBGROUP_FEATURE_SHUFFLE_BIT :
+                VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT;
+        } else if ((op >= 259 && op <= 271) || op == 5296 || op == 224 ||
+                   (op >= 4421 && op <= 4422) || (op >= 4428 && op <= 4430) || op == 4432 ||
+                   (op >= 5000 && op <= 5007) || (op >= 5571 && op <= 5578) ||
+                   (op >= 5580 && op <= 5581) || (op >= 5713 && op <= 5816)) goto done;
+        i += n;
+    }
+    // The specialized GroupNonUniform capabilities imply GroupNonUniform;
+    // Ryujinx does not repeat that base declaration in generated modules.
+    if (declared) declared |= VK_SUBGROUP_FEATURE_BASIC_BIT;
+    uint32_t required = (system_inputs & 1 ? VK_SUBGROUP_FEATURE_BASIC_BIT : 0) |
+                        (system_inputs & 2 ? VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_BALLOT_BIT : 0);
+    if ((required | operations) & ~declared) goto done;
+    // The selected system-input subset also requires reported GS support.
+    // This is a conservative admission policy, not a claim that a builtin load
+    // itself is a group operation covered by VUID 06343.
+    if ((declared & ~P.subgroup_operations) ||
+        ((system_inputs || operations) && !(P.subgroup_stages & VK_SHADER_STAGE_GEOMETRY_BIT))) goto done;
+    ok = 1;
+done:
+    free(id);
+    return ok;
+}
 
 static int geometry_numeric(const GeometryId *id, uint32_t bound, uint32_t type, int array,
                             uint32_t *components, uint64_t *signature, GfxShaderIo *io) {
@@ -1085,7 +1198,7 @@ static int geometry_interface(const GfxShader *s, uint32_t storage, uint32_t ver
         else if (op == 71 && n >= 3 && a[0] < bound) {
             GeometryId *d = &id[a[0]];
             if (a[1] == 30) { if (n != 4 || a[2] >= 32 || d->location) goto done; d->location = a[2] + 1; }
-            else if (a[1] == 11) { if (n != 4 || a[2] >= 64 || d->builtin) goto done; d->builtin = a[2] + 1; }
+            else if (a[1] == 11) { if (n != 4 || (a[2] >= 64 && a[2] != 4420) || d->builtin) goto done; d->builtin = a[2] + 1; }
             else if (a[1] == 31) d->component = 1;
             else if (a[1] == 2) d->block = 1;
             else if (a[1] == 14) d->flat = d->interpolation = 1;
@@ -1112,6 +1225,11 @@ static int geometry_interface(const GfxShader *s, uint32_t storage, uint32_t ver
         uint32_t type = id[var->type].x;
         if (!type || type >= bound || var->component || var->unsupported ||
             (var->builtin && var->interpolation)) goto done;
+        if (var->builtin == 42 || var->builtin == 4421) {
+            if (stage != GFX_STAGE_GS || storage != 1 ||
+                !geometry_system_input(id, bound, var, type, &out->system_inputs)) goto done;
+            continue;
+        }
         if (stage == GFX_STAGE_GS && storage == 1 && id[type].op == 28) {
             uint32_t length = id[type].y;
             if (!length || length >= bound || id[length].op != 43 || id[length].x != vertices ||
@@ -1251,6 +1369,7 @@ static const char *geometry_validate(const VkPipeState *s, const VkPhysicalDevic
     if (!geometry_interface(s->vs, 3, 0, &vo)) return "unsupported vertex output interface or missing scalar-width metadata";
     if (!geometry_interface(s->gs, 1, g->input_vertices, &gi)) return "unsupported geometry input interface or missing scalar-width metadata";
     if (!geometry_interface(s->gs, 3, 0, &go)) return "unsupported geometry output interface or missing scalar-width metadata";
+    if (!geometry_subgroups(s->gs, gi.system_inputs)) return "unsupported geometry subgroup capability, operation or stage";
     uint64_t per_vertex = UINT64_C(1) | UINT64_C(1) << 1 | UINT64_C(1) << 3 | UINT64_C(1) << 4;
     uint64_t generated = (UINT64_C(1) << 7) | (UINT64_C(1) << 8); // PrimitiveId / InvocationId are not VS outputs
     if ((gi.builtin_mask & ~(per_vertex | generated)) || (go.builtin_mask & ~per_vertex))
