@@ -787,8 +787,9 @@ static void count_use(int cls, int use, uint64_t n) {
 // A buffer descriptor for [addr, addr+size) of guest memory: its backing (a pool's VRAM mirror when it has one) when
 // aligned, a copy in transient memory when the backing is host memory with an unaligned offset. 0 when neither works.
 // written: the shader stores into it (a mirror's range goes back to guest memory at the end of the submission).
+// direct_only: guarded aliases must share the real backing; a transient copy would lose writes and alias coherence.
 static int bind_range(VkExec *ex, uint64_t addr, uint64_t size, uint64_t align, uint64_t max, int use, int written,
-                      VkDescriptorBufferInfo *out) {
+                      int direct_only, VkDescriptorBufferInfo *out) {
     VkMemSpan sp;
     if (!addr || !vk_mem_resolve(addr, 1, &sp)) return 0;
     uint64_t n = size && size < sp.avail ? size : sp.avail;
@@ -802,7 +803,7 @@ static int bind_range(VkExec *ex, uint64_t addr, uint64_t size, uint64_t align, 
         VK_MEM_BOUND(sp);
         return 1;
     }
-    if (sp.alloc) return 0;
+    if (sp.alloc || direct_only) return 0;
     VkBuffer b;
     VkDeviceSize o;
     RS.volatile_ = 1;
@@ -905,7 +906,7 @@ static VkDescriptorBufferInfo ubo_info(VkExec *ex, int st, int slot) {
         uint32_t len, c1;
         if (find_stage(ex->prog, st, &ctl, &code, &len)) {
             memcpy(&c1, ctl + 0x700, 4);
-            if (c1 < len && bind_range(ex, (uint64_t)(uintptr_t)code + c1, len - c1, align, max, VK_MUSE_UBO, 0, &bi))
+            if (c1 < len && bind_range(ex, (uint64_t)(uintptr_t)code + c1, len - c1, align, max, VK_MUSE_UBO, 0, 0, &bi))
                 return bi;
             if (c1 < len && len - c1 <= max) {   // NVN 2 stages: the lowered code (nvn2_lower.cpp) is host memory
                 VkBuffer b;
@@ -941,7 +942,7 @@ static VkDescriptorBufferInfo ubo_info(VkExec *ex, int st, int slot) {
             count_use(VK_MCLS_SCRATCH, VK_MUSE_UBO, bi.range);
             return bi;
         }
-        if (bind_range(ex, b->addr, b->size, align, max, VK_MUSE_UBO, 0, &bi)) return bi;
+        if (bind_range(ex, b->addr, b->size, align, max, VK_MUSE_UBO, 0, 0, &bi)) return bi;
     }
     return zero_info(max);
 }
@@ -1011,20 +1012,63 @@ static uint64_t ubo_ptr(const VkExec *ex, int st, const GfxShaderRes *r) {
     return a;
 }
 
+// Guarded NVN 2 candidates use the same bytes that the dispatch binds as uniform banks. Bank 0 includes pushed
+// roots and packed descriptor tables; bank 1 is the program's bounded compiler-constant data. No scalar is guessed
+// to be a pointer here: bind_range determines whether a candidate has backing, and the shader checks the true range.
+static p_bind_buf guarded_storage_binding(const VkExec *ex, int st, const GfxShaderRes *r) {
+    uint64_t off = (uint64_t)r->handle * 4;
+    p_bind_buf b = {0};
+    if (st != NVN_STAGE_CS || !c0_lay) return b;
+    if (r->cbuf_slot == 0) {
+        if (!c0_on() || off > VK_C0_BYTES - 8) return b;
+        uint8_t bank[VK_C0_BYTES];
+        vk_c0_fill(bank, st, ex->ssbo[st], ex->ubo[st], c0_dim, c0_binst);
+        memcpy(&b.addr, bank + off, 8);
+        size_t ub = nvn2_c0_part(c0_lay, 1), end = nvn2_c0_part(c0_lay, 3);
+        if (off >= ub && off < end && (off - ub) % 16 == 0) {
+            uint32_t bytes;
+            memcpy(&bytes, bank + off + 8, 4);
+            b.size = bytes;   // preserve a typed table's declared extent, not the remainder of its pool
+        }
+    } else if (r->cbuf_slot == 1 && ex->prog) {
+        const uint8_t *ctl, *code;
+        uint32_t len, c1;
+        if (!find_stage(ex->prog, st, &ctl, &code, &len)) return b;
+        memcpy(&c1, ctl + 0x700, 4);
+        if (c1 > len || off > len - c1 || len - c1 - off < 8) return b;
+        memcpy(&b.addr, code + c1 + off, 8);
+    } else if (r->cbuf_slot == 17) {
+        // ubo_info binds the synthetic compute push bank here, before its user-UBO mapping. Unwritten words are zero.
+        if (off > sizeof ex->push[1][0] - 8) return b;
+        uint32_t words[2] = {0};
+        for (unsigned i = 0; i < 2; i++) {
+            unsigned word = r->handle + i;
+            if (ex->push_set[1][0] >> word & 1) words[i] = ex->push[1][0][word];
+        }
+        memcpy(&b.addr, words, 8);
+    } else if (ubo_ptr_res(r)) {
+        b.addr = ubo_ptr(ex, st, r);
+    }
+    return b;
+}
+
 static VkDescriptorBufferInfo ssbo_info(VkExec *ex, int st, const GfxShaderRes *r, int written) {
     if (!__atomic_load_n(&LIM.ubo_max, __ATOMIC_ACQUIRE)) limits_init();
     uint64_t max = LIM.sbo_max, align = LIM.sbo_align;
     VkDescriptorBufferInfo bi;
-    int ubo, slot = ssbo_slot(r, st, &ubo);
+    int ubo = 0, slot = -1;
     p_bind_buf up = {0};
     const p_bind_buf *b = NULL;
-    if (slot >= 0 && slot < 16) b = ubo ? &ex->ubo[st][slot] : &ex->ssbo[st][slot];
+    int guarded = !!(r->flags & GFX_RES_SSBO_GUARDED);
+    if (!guarded) slot = ssbo_slot(r, st, &ubo);
+    if (guarded) up = guarded_storage_binding(ex, st, r), b = &up;
+    else if (slot >= 0 && slot < 16) b = ubo ? &ex->ubo[st][slot] : &ex->ssbo[st][slot];
     else if (ubo_ptr_res(r)) up.addr = ubo_ptr(ex, st, r), b = &up;   // size 0: up to the end of the backing
     if (b) {
         // vk_caps.c: shaders translated for sbuf_align address the buffer from its address rounded down to it.
         uint64_t lead = vk_caps.sbuf_align ? b->addr & (vk_caps.sbuf_align - 1) : 0;
         if (bind_range(ex, b->addr - lead, b->size ? b->size + lead : 0, align, max, ubo ? VK_MUSE_UBO : VK_MUSE_SSBO,
-                       written, &bi)) {
+                       written, guarded, &bi)) {
             if (written && bi.buffer != VK_NULL_HANDLE) {
                 note_written(ex, b->addr - lead, bi.range);
                 const uint8_t *ctl, *code;
@@ -1034,13 +1078,17 @@ static VkDescriptorBufferInfo ssbo_info(VkExec *ex, int st, const GfxShaderRes *
             }
             return bi;
         }
-        if (b->addr) warn_once(W_SSBO_ALIGN, "storage buffer %#llx is not backed or not aligned: a zero buffer is bound",
+        if (b->addr && !guarded) warn_once(W_SSBO_ALIGN, "storage buffer %#llx is not backed or not aligned: a zero buffer is bound",
                                (unsigned long long)b->addr);
     } else {
         warn_once(W_SSBO_SLOT, "a storage buffer whose address is at c%d+%#x (stage %d) is not replayed: a zero buffer is bound",
                   r->cbuf_slot, r->handle * 4, st);
     }
-    return zero_info(max);
+    bi = zero_info(max);
+    // Vulkan requires a nonzero descriptor range. One byte is zero elements of the shader's uint runtime array;
+    // the guarded operation branches away without touching it. Unguarded users retain the existing 64 KiB dummy.
+    if (guarded) bi.range = 1;
+    return bi;
 }
 
 // ---- feedback loops (maxwell.md 1.9, vk.h VkCtx.feedback)

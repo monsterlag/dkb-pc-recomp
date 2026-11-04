@@ -83,6 +83,8 @@ const uint32_t *gfx_shader_spirv(const GfxShader *s, uint64_t *words);
 uint64_t gfx_shader_failures(void);                         // failed translations; feeds GfxStats.shader_failures
 // Reflection: parsed once per shader from the translator's .res.json and the SPIR-V before it enters the cache.
 enum { GFX_RES_UBO, GFX_RES_SSBO, GFX_RES_TEX, GFX_RES_IMG, GFX_RES_KINDS };
+// Version 1 requires guarded SSBOs to expose zero array elements when their address cannot be bound.
+enum { GFX_STORAGE_CANDIDATES_VERSION = 1, GFX_RES_SSBO_GUARDED = 0x80 };
 typedef struct {
     uint16_t set, binding;      // as the SPIR-V decorates them: set 0, bindings from 1 per shader (0: support buffer)
     int16_t slot;               // UBO: c[slot]; SSBO: storage buffer index; TEX: c2 combined slot (handle at 0x20 + 8 slot)
@@ -90,7 +92,7 @@ typedef struct {
     uint16_t type;              // TEX/IMG: Ryujinx SamplerType: 1 1D, 2 buffer, 3 2D, 4 3D, 5 cube | 0x100 array,
                                 // 0x200 multisample, 0x400 shadow
     uint8_t format;             // IMG: declared format as a GfxShaderAnswers.img_format code, 0 unknown
-    uint8_t flags;              // SSBO: 1 written; TEX/IMG: Ryujinx TextureUsageFlags (4 image store, 8 coherent)
+    uint8_t flags;              // SSBO: 1 written, GFX_RES_SSBO_GUARDED; TEX/IMG: Ryujinx TextureUsageFlags
     int8_t cbuf_slot;           // TEX/IMG: constant buffer of the handle (-1: bound texture buffer); SSBO: of its address
     uint16_t handle;            // TEX/IMG: raw handle (word offset; separate: texture | sampler << 14); SSBO: address offset
     uint16_t count;             // descriptors (array length)

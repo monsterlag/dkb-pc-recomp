@@ -1,8 +1,9 @@
 """Build the shader translator: build/xlate/totk_xlate.exe (Ryujinx 1.3.2 + patches, NativeAOT, SPIR-V for Vulkan).
 
 Copies tools/vendor/ryujinx to build/xlate/ryujinx, applies the selected tools/xlate/patches there (tools/vendor stays
-byte-identical), then runs `dotnet publish`. The default applies patches 0001-0013, preserving the fast floating
-min/max/clamp operations. --defined-float-minmax also applies 0014's integer selection and numeric constant folding;
+byte-identical), then runs `dotnet publish`. The default applies patches 0001-0013 and 0015, preserving the fast floating
+min/max/clamp operations. Patch 0015 makes runtime storage-candidate resolution available only to explicit version-1
+NVN 2 compute requests; missing/version-0 requests retain the legacy pass. --defined-float-minmax also applies 0014's integer selection and numeric constant folding;
 this adds shader ALU work and has no established game visual or frame-time benefit. Needs the .NET 10 SDK, the MSVC build
 tools and vswhere.exe (docs/building.md). Run with .venv. On Linux it builds build/xlate/totk_xlate for linux-x64, which
 NativeAOT links with the system's clang (no MSVC); NativeAOT builds for the OS it runs on only.
@@ -96,8 +97,8 @@ def verify_vendor() -> None:
 
 def selected_patches(*, defined_float_minmax: bool = False) -> list[Path]:
     patches = sorted((XLATE / "patches").glob("*.patch"))
-    if len(patches) != 14:
-        sys.exit(f"expected 14 patches, found {len(patches)}")
+    if len(patches) != 15:
+        sys.exit(f"expected 15 patches, found {len(patches)}")
     optional = XLATE / "patches" / DEFINED_FLOAT_MINMAX_PATCH
     if optional not in patches:
         sys.exit(f"missing optional patch: {DEFINED_FLOAT_MINMAX_PATCH}")
