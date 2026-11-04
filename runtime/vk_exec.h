@@ -109,6 +109,13 @@ typedef struct VkExec {
     uint32_t tex_serial, pass_serial;    // bumped by every texture or image bind and pass begin
 } VkExec;
 
+typedef void (*VkExecWorkFn)(VkExec *ex, void *context);
+// Synchronous CPU recording from the submit callback above: no nested submission/replay and no other queue owner.
+int vk_exec_record_work(VkCommandBuffer cb, uint64_t fence, uint64_t submitted_ticks,
+                        VkExecWorkFn work, void *context);
+// Reset a validated selected pointer list in replay order. Returns 0 without record writes on invalid input.
+int vk_exec_reset_indirect(VkExec *ex, uint64_t list_addr, uint32_t descriptor_bytes, int64_t first, int64_t count);
+
 // Begins dynamic rendering with the current targets unless a pass is open (a full memory barrier precedes it). Call
 // before a draw or an attachment clear.
 void vk_exec_pass_begin(VkExec *ex);
@@ -122,6 +129,9 @@ void vk_exec_barrier(VkExec *ex);
 // when this thread is not recording a replay. vk_exec_inline_end begins the pass again when it was open.
 // vk_exec_inline_buffer: a device buffer for transfers, destroyed when the submission completes.
 VkCommandBuffer vk_exec_inline_begin(int *reopen);
+// Ordered GPU-visible read during active replay. Requires one contiguous mapping, four-byte alignment and size
+// from 4 bytes through 8 MiB. Submits/waits the prefix and continues recording; never dereferences a guest address.
+int vk_exec_read_buffer(VkExec *ex, uint64_t addr, uint64_t size, void *out);
 void vk_exec_inline_end(int reopen);
 // vk_exec_draw.c: forget what the command buffer being recorded has bound (pipeline, sets, dynamic state, vertex
 // buffers): the replay continues in a new one (vk_sync_split).

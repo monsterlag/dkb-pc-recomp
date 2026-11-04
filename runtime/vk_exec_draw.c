@@ -25,6 +25,7 @@
 #include "host.h"
 #include "nvn_api.h"
 #include "nvn_hmap.h"
+#include "nvn_indirect_reset.h"
 #include "vk.h"
 #include "vk_exec.h"
 #include "platform/platform.h"
@@ -48,7 +49,7 @@ static void c0_lay_set(VkExec *ex, const GfxShader *cs) {
     c0_push = ex->push[1];
 }
 
-enum { W_PROGRAM, W_SHADER, W_PIPELINE, W_NO_VS, W_INDEX, W_UB, W_BIND, W_SSBO_ALIGN, W_SSBO_SLOT, W_RESTART, W_INDIRECT, W_FAULT_SKIP, W_FAULT_SKIP2, W_COUNT };
+enum { W_PROGRAM, W_SHADER, W_PIPELINE, W_NO_VS, W_INDEX, W_UB, W_BIND, W_SSBO_ALIGN, W_SSBO_SLOT, W_RESTART, W_INDIRECT, W_FAULT_SKIP, W_FAULT_SKIP2, W_RESET, W_COUNT };
 
 static void warn_once(int key, const char *fmt, ...) {
     static volatile int32_t seen[W_COUNT];
@@ -266,6 +267,55 @@ static void note_written(VkExec *ex, uint64_t addr, uint64_t size) {
     vk_mem_gpu_pending(addr, size);
 }
 
+static int reset_mapped(void *context, uint64_t addr, uint32_t size) {
+    (void)context;
+    VkMemSpan span;
+    return vk_mem_resolve(addr, size, &span);
+}
+
+// The pointer list may have been written earlier in this submission. Read its GPU-visible contents after submitting
+// that prefix, then validate every target before recording a write. Null pointers have no record to reset.
+int vk_exec_reset_indirect(VkExec *ex, uint64_t list_addr, uint32_t descriptor_bytes, int64_t first, int64_t count) {
+    NvnIndirectResetList list;
+    if (!nvn_indirect_reset_list(list_addr, descriptor_bytes, first, count, &list)) return 0;
+    uint64_t *pointers = malloc(list.bytes);
+    if (!pointers) rt_fatal("vk: out of memory reading an indirect-reset pointer list");
+    if (!vk_exec_read_buffer(ex, list.begin, list.bytes, pointers) ||
+        !nvn_indirect_reset_targets(&list, pointers, reset_mapped, NULL)) {
+        free(pointers);
+        return 0;
+    }
+    VkBuffer source;
+    VkDeviceSize source_offset;
+    static const uint32_t record[5] = {0, 1, 0, 0, 0};
+    memcpy(scratch(ex, sizeof record, &source, &source_offset), record, sizeof record);
+    CbRes *resources = cb_res(ex);
+    Chunk *chunk = &resources->chunks[resources->nchunks - 1];
+    if (vmaFlushAllocation(vk_ctx()->vma, chunk->alloc, source_offset, sizeof record) != VK_SUCCESS)
+        rt_fatal("vk: flushing indirect-reset values failed");
+    for (uint32_t i = 0; i < list.count; i++) {
+        uint64_t addr = pointers[i];
+        if (!addr) continue;
+        VkMemSpan span;
+        if (!vk_mem_resolve(addr, sizeof record, &span))
+            rt_fatal("vk: an indirect-reset mapping changed during replay");
+        // Commit first-use imports to their mirror before choosing the destination. A later indirect bind must
+        // read this same backing rather than create a mirror from the old contents.
+        VK_MEM_USE(span);
+        vk_exec_barrier(ex);   // also preserves the input order of duplicate or overlapping target ranges
+        VkBufferCopy copy = {source_offset, span.offset, sizeof record};
+        vkCmdCopyBuffer(ex->cb, source, span.buffer, 1, &copy);
+        ex->recorded++;
+        vk_mem_gpu_wrote(&span, sizeof record);
+        vk_usnap_drop(addr, sizeof record);
+        vk_mem_count(span.cls, VK_MUSE_GPU_WRITE, sizeof record);
+        note_written(ex, addr, sizeof record);
+    }
+    free(pointers);
+    vk_exec_barrier(ex);   // subsequent shader accesses and indirect reads see every completed record
+    return 1;
+}
+
 // ---- stand-ins for what a binding names but the game did not bind (zeros, a 1x1 image, the default sampler)
 
 enum { DV_1D, DV_1D_ARRAY, DV_2D, DV_2D_ARRAY, DV_3D, DV_CUBE, DV_CUBE_ARRAY, DV_2D_MS, DV_2D_MS_ARRAY, DV_COUNT };
@@ -383,10 +433,10 @@ static void twins_release(VkCtx *c);
 // Releases the stand-ins and the depth twins. The device must be idle; the game path leaves them to process exit like
 // the pipelines.
 void vk_exec_draw_shutdown(void) {
-    if (!Z.ready) return;
     VkCtx *c = vk_ctx();
+    if (!c) return;
     twins_release(c);
-    for (int i = 0; i < DV_COUNT; i++) {
+    for (int i = 0; Z.ready && i < DV_COUNT; i++) {
         if (Z.img[i].sview != Z.img[i].view) vkDestroyImageView(c->device, Z.img[i].sview, NULL);
         vkDestroyImageView(c->device, Z.img[i].view, NULL);
         vmaDestroyImage(c->vma, Z.img[i].image, Z.img[i].alloc);
@@ -402,9 +452,12 @@ void vk_exec_draw_shutdown(void) {
     for (int i = 0; i < nspare_pool; i++) vkDestroyDescriptorPool(c->device, spare_pool[i], NULL);
     for (int i = 0; i < nspare_chunk; i++) vmaDestroyBuffer(c->vma, spare_chunk[i].buf, spare_chunk[i].alloc);
     nspare_pool = nspare_chunk = 0;
+    cur = NULL, cur_fence = 0;
     vk_usnap_shutdown();
-    vkDestroyBufferView(c->device, Z.zview, NULL);
-    vmaDestroyBuffer(c->vma, Z.zbuf, Z.zalloc);
+    if (Z.ready) {
+        vkDestroyBufferView(c->device, Z.zview, NULL);
+        vmaDestroyBuffer(c->vma, Z.zbuf, Z.zalloc);
+    }
     memset(&Z, 0, sizeof Z);
 }
 
@@ -2347,8 +2400,28 @@ static void bind_index(VkExec *ex, const void *data, uint64_t bytes, VkIndexType
     ex->recorded++;
 }
 
+// The Bananza reset vertex program loses stores through pointers loaded from a list. Match both locally confirmed
+// stages and the observed one-instance point-draw form. Other programs and parameter forms keep the shader path.
+static int indirect_reset_draw(VkExec *ex, const p_draw *d) {
+    if (rt_game_version || !cfg_bool("TOTK_FIX_INDIRECT_RESET") || !c0_on() || ex->render_disabled ||
+        getenv("DKB_SKIP_DRAWS") || !ex->prog || ex->prog->nstage != 2 || d->prim != NVN_DRAW_PRIMITIVE_POINTS ||
+        d->count <= 0 || d->first < 0 || d->base_instance || d->instances != 1) return 0;
+    const uint8_t *ctl, *code;
+    uint32_t length;
+    if (!find_stage(ex->prog, NVN_STAGE_VS, &ctl, &code, &length) || nvn2_origin(code) != 0xe78abde51f2d6bfaull ||
+        !find_stage(ex->prog, NVN_STAGE_FS, &ctl, &code, &length) || nvn2_origin(code) != 0x57b0d7b4959f03c0ull) return 0;
+    const p_bind_buf *list = &ex->ssbo[NVN_STAGE_VS][0];
+    // c0_table encodes the binding's size as u32 at +0x118; use the same extent, including its zero rejection.
+    if (!vk_exec_reset_indirect(ex, list->addr, (uint32_t)list->size, d->first, d->count)) {
+        warn_once(W_RESET, "the matched indirect reset has an unsupported list or record: using its shader");
+        return 0;
+    }
+    return 1;
+}
+
 static void op_draw(VkExec *ex, const p_draw *d) {
     c0_binst = (uint32_t)d->base_instance;
+    if (indirect_reset_draw(ex, d)) return;
     if (d->count <= 0 || !prepare_draw(ex, d->prim, d->count, 0)) return;
     vk_exec_frame.draws++;
     uint32_t inst = d->instances > 0 ? (uint32_t)d->instances : 1, first = (uint32_t)d->first, n = (uint32_t)d->count;

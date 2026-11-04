@@ -825,6 +825,54 @@ static void maybe_split(VkExec *ex) {
     n_parts++;
 }
 
+// An ordered read of the GPU-visible backing at this replay position. In particular, imported guest bytes can be
+// older than their shadow or VRAM mirror. Read through the same resolver/pick path as a buffer copy, never the VA.
+int vk_exec_read_buffer(VkExec *ex, uint64_t addr, uint64_t size, void *out) {
+    if (!x_here || ex != &X || !ex->cb || !out || !addr || !size || size > (8ull << 20) ||
+        addr > UINT64_MAX - size || (addr & 3) || (size & 3)) return 0;
+    VkMemSpan source;
+    if (!vk_mem_resolve(addr, size, &source) || !source.buffer || source.avail < size || (source.offset & 3)) return 0;
+    VK_MEM_PICK(source);   // choose an existing mirror; a read does not create a new one
+    if (!source.buffer) return 0;
+    VkCtx *c = vk_ctx();
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VmaAllocation allocation = NULL;
+    VmaAllocationInfo mapped = {0};
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = size,
+                             .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+    VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+        .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT};
+    if (vmaCreateBuffer(c->vma, &bi, &ai, &buffer, &allocation, &mapped) != VK_SUCCESS) return 0;
+    if (!mapped.pMappedData) { vmaDestroyBuffer(c->vma, buffer, allocation); return 0; }
+    vk_exec_barrier(ex);   // end rendering and order all earlier writes before the transfer
+    VkBufferCopy copy = {.srcOffset = source.offset, .dstOffset = 0, .size = size};
+    vkCmdCopyBuffer(ex->cb, source.buffer, buffer, 1, &copy);
+    VkBufferMemoryBarrier2 host = {.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
+        .srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT, .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+        .dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT, .dstAccessMask = VK_ACCESS_2_HOST_READ_BIT,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .buffer = buffer, .offset = 0, .size = size};
+    VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+                           .bufferMemoryBarrierCount = 1, .pBufferMemoryBarriers = &host};
+    vkCmdPipelineBarrier2(ex->cb, &di);
+    ex->recorded += 2;
+    vk_mem_count(source.cls, VK_MUSE_COPY_SRC, size);
+    VK_MEM_BOUND(source);
+    ex->cb = vk_sync_split_wait();   // this prefix, not ex->fence (only the final part signals that value)
+    split_draws = 0;
+    part_start = ex->recorded;
+    part_t0 = kern_now_ns();
+    ex->barrier_at = -1;
+    ex->dirty = VK_EXEC_DIRTY_ALL;
+    vk_exec_draw_new_cb();
+    n_parts++;
+    VkResult result = vmaInvalidateAllocation(c->vma, allocation, 0, size);
+    if (result == VK_SUCCESS) memcpy(out, mapped.pMappedData, (size_t)size);
+    // split_wait is fatal on submission/wait failure, so this allocation is never freed while the copy is in flight.
+    vmaDestroyBuffer(c->vma, buffer, allocation);
+    return result == VK_SUCCESS;
+}
+
 static void walk(VkExec *ex, const op_hdr *h, int depth) {
     for (;;) {
         if (h->size < sizeof *h || (h->size & 7) || h->op >= OP_COUNT_)
@@ -909,7 +957,8 @@ static void walk(VkExec *ex, const op_hdr *h, int depth) {
     }
 }
 
-int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t fence, uint64_t submitted_ticks) {
+static int record_impl(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t fence, uint64_t submitted_ticks,
+                       VkExecWorkFn work, void *context) {
     VkExec *ex = &X;
     if (!x_ready) state_reset(ex), vk_dump_init(), x_ready = 1;
     ex->cb = cb;
@@ -926,15 +975,19 @@ int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t 
     split_draws = part_start = 0;
     part_t0 = kern_now_ns();
     x_here = 1;
-    if (n) vk_mem_mirror_begin(), vk_usnap_begin(handles, n, fence);
-    for (int i = 0; i < n; i++) {
-        if (!handles[i]) rt_fatal("vk: command handle %d of a submission is null", i);
-        walk(ex, nvn_op_first(handles[i]), 0);
+    int memory = n || work;
+    if (memory) vk_mem_mirror_begin(), vk_usnap_begin(handles, n, fence);
+    if (work) work(ex, context);
+    else {
+        for (int i = 0; i < n; i++) {
+            if (!handles[i]) rt_fatal("vk: command handle %d of a submission is null", i);
+            walk(ex, nvn_op_first(handles[i]), 0);
+        }
     }
     vk_exec_pass_end(ex);
     x_here = 0;
     if (ex->recorded) vk_exec_barrier(ex);   // later submissions see this one's writes
-    if (n) ex->recorded += vk_mem_mirror_end(ex->cb, fence), vk_usnap_end(fence);   // VRAM mirror bytes the GPU wrote go back to guest memory
+    if (memory) ex->recorded += vk_mem_mirror_end(ex->cb, fence), vk_usnap_end(fence);   // VRAM mirror bytes the GPU wrote go back to guest memory
     if (ex->nviews) {
         ViewList *l = malloc(sizeof *l + sizeof(VkImageView) * (size_t)ex->nviews);
         if (!l) rt_fatal("vk: out of memory");
@@ -944,10 +997,19 @@ int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t 
         ex->nviews = 0;
     }
     ex->cb = VK_NULL_HANDLE;
-    if (n) n_subs++;
+    if (memory) n_subs++;
     if ((rt_trace & RT_TRACE_PERF) && n_subs >= 240) {
         rt_log("perf: replay command buffer parts per submission %.2f", (double)(n_subs + n_parts) / (double)n_subs);
         n_subs = n_parts = 0;
     }
     return ex->recorded - part_start;   // what the last part holds
+}
+
+int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t fence, uint64_t submitted_ticks) {
+    return record_impl(cb, handles, n, fence, submitted_ticks, NULL, NULL);
+}
+
+int vk_exec_record_work(VkCommandBuffer cb, uint64_t fence, uint64_t submitted_ticks, VkExecWorkFn work, void *context) {
+    if (!work) rt_fatal("vk: work recording without a callback");
+    return record_impl(cb, NULL, 0, fence, submitted_ticks, work, context);
 }

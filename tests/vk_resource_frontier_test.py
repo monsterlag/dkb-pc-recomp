@@ -66,6 +66,16 @@ def main():
             result.append(body)
         return '\n\n'.join(result)
 
+    if 'static VkCommandBuffer split_impl(' in sync:
+        # Follow the real shared split/submit lifecycle while retaining older-source RED comparisons.
+        sync_functions = functions('vk_sync.c', ('claim_slot', 'take_slot', 'split_impl', 'vk_sync_split',
+                                                'vk_sync_submit_record'))
+        sync_functions += '\n' + between(sync, 'typedef struct { const uint64_t *handles; int n; } ReplayHandles;',
+                                          'static int record_handles(')
+        sync_functions += '\n' + functions('vk_sync.c', ('record_handles', 'vk_sync_submit'))
+    else:
+        sync_functions = functions('vk_sync.c', sync_names)
+
     replacements = {
         '@TEXTURE_TYPES@': between(texture, 'typedef struct {\n    uint64_t addr;', 'typedef struct { samp_par p;'),
         '@MEMORY_TYPES@': between(memory, 'typedef struct { VkBuffer buf; VmaAllocation alloc; } Staging;',
@@ -75,7 +85,7 @@ def main():
         '@MEMORY_FUNCTIONS@': functions('vk_memory.c', memory_names),
         '@TEXTURE_FUNCTIONS@': functions('vk_texture.c', texture_names),
         '@VIEW_FUNCTION@': functions('vk_exec_draw.c', ('vk_exec_image_gone',)),
-        '@SYNC_FUNCTIONS@': functions('vk_sync.c', sync_names),
+        '@SYNC_FUNCTIONS@': sync_functions,
         '@FRONTIER@': frontier,
     }
     fixture = (ROOT / 'tests/vk_resource_frontier.c').read_text(encoding='utf-8')

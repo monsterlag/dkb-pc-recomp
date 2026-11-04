@@ -24,6 +24,7 @@
 #define vkQueueSubmit2 synthetic_submit
 #define vkDeviceWaitIdle synthetic_device_idle
 #define vkDestroyFence synthetic_destroy_fence
+#define vkCreateFence synthetic_create_fence
 #define vkDestroyCommandPool synthetic_destroy_pool
 #define vmaDestroyPool synthetic_vma_destroy_pool
 #define vkGetPhysicalDeviceQueueFamilyProperties synthetic_queue_families
@@ -50,6 +51,10 @@ void rt_log(const char *format, ...) { (void)format; }
 void perf_count(int kind) { (void)kind; }
 uint64_t perf_begin(void) { return 0; }
 void perf_replay(uint64_t start) { (void)start; }
+// The actual shared split helper also contains the ordered-readback branch. Retirement scenarios must keep using
+// the nonwaiting branch; reaching any of these new dependencies is a fixture failure, not a simulated success.
+void perf_end(int kind, uint64_t start) { (void)kind; (void)start; check(0, "retirement never times a prefix wait"); }
+void perf_gpu_wait(uint64_t start) { (void)start; check(0, "retirement never waits for a prefix"); }
 int cfg_bool(const char *key) { check(!strcmp(key, "TOTK_TEX_ALIAS"), "default texture alias setting"); return 1; }
 VkCtx *vk_ctx(void) { return &context; }
 // Upload batch timing (vk_memory.c, inserted with the memory types): the synthetic device has no queue family with timestamps
@@ -149,6 +154,9 @@ static void synthetic_vma_destroy_buffer(VmaAllocator a, VkBuffer b, VmaAllocati
     (void)a; (void)b; (void)m; check(0, "fixture retires images and views only");
 }
 static void synthetic_destroy_fence(VkDevice d, VkFence f, const VkAllocationCallbacks *a) { (void)d; (void)f; (void)a; check(0, "no staging fences"); }
+static VkResult synthetic_create_fence(VkDevice d, const VkFenceCreateInfo *i, const VkAllocationCallbacks *a, VkFence *f) {
+    (void)d; (void)i; (void)a; (void)f; check(0, "retirement never creates a prefix fence"); return VK_ERROR_UNKNOWN;
+}
 static void synthetic_destroy_pool(VkDevice d, VkCommandPool p, const VkAllocationCallbacks *a) { (void)d; (void)p; (void)a; check(0, "no upload command pool"); }
 static void synthetic_vma_destroy_pool(VmaAllocator a, VmaPool p) { (void)a; (void)p; check(0, "no staging pool"); }
 static VkResult synthetic_device_idle(VkDevice d) {

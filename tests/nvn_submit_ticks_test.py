@@ -58,9 +58,13 @@ def main():
     types = backend[backend.index('enum { RI_SUBMIT'):backend.index('#define RQ_CAP')]
     callback = xfer[xfer.index('static void write_counter_at('):xfer.index('// Reports queued by the replay')]
     branch = function(backend, 'if (it.kind == RI_SUBMIT)')
+    # The handle entry now forwards into a shared recorder. Keep executing its actual lifecycle, not a stand-in.
+    record = function(execute, 'int vk_exec_record(')
+    if 'static int record_impl(' in execute:
+        record = function(execute, 'static int record_impl(') + '\n' + record
     replacements = {'@API@': str(int(api)), '@GLOBALS@': globals_, '@REPLAY_TYPES@': types,
                     '@COUNTERS@': callback + function(xfer, 'static void report_counter('),
-                    '@RECORD@': function(execute, 'int vk_exec_record('),
+                    '@RECORD@': record,
                     '@BACKEND@': function(backend, 'static uint64_t submit_sync(') + '\n' +
                                  function(backend, 'static uint64_t vk_be_submit('),
                     '@FRONTEND@': function(core, 'NVN_API(nvnQueueSubmitCommands)'), '@SUBMIT_BRANCH@': branch}

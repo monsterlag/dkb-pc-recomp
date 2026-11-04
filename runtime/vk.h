@@ -380,10 +380,18 @@ void vk_sync_shutdown(void);               // finish, stop the completion thread
 // command buffer it holds at the end (0: that one stays empty and is not submitted). A weak vk_sync.c version accepts
 // empty streams only.
 int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t fence, uint64_t submitted_ticks);
+// Record internal GPU work through the same submission and completion lifetime as NVN command handles. CPU
+// recording is synchronous. Only the queue owner or an exclusively drained/idle backend may call it, without
+// simultaneous producers. Preserve queued-fence order; never nest submission or replay inside the callback.
+typedef int (*VkSyncRecordFn)(VkCommandBuffer cb, uint64_t fence, uint64_t submitted_ticks, void *context);
+uint64_t vk_sync_submit_record(VkSyncRecordFn record, void *context, uint64_t submitted_ticks);
 // Inside vk_exec_record, outside a render pass: ends the command buffer recorded so far, submits it (after the upload
 // batch) without a signal, and returns a new begun one for the rest of the submission. The submission's timeline value
 // is signalled by its last part, whose signal covers every earlier part in submission order.
 VkCommandBuffer vk_sync_split(void);
+// Submit the recorded prefix and wait for its dedicated fence, without advancing the full submission's timeline.
+// Replay thread, outside a render pass. Returns a fresh recording command buffer; old resources keep their lifetime.
+VkCommandBuffer vk_sync_split_wait(void);
 // TOTK_TRACE=perf: the replay notes each draw or dispatch of the part being timed (kind 0 draw, 1 indirect draw, 2
 // dispatch, 3 indirect dispatch; a, b: the NVN 2 names of its vertex and fragment stages, or its compute stage and 0;
 // work: vertices x instances or groups, 0 when indirect), so a slow part can name its work. vk_sync_noting: 1 while

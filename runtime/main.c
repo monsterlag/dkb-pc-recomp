@@ -441,7 +441,7 @@ static int usage(const char *argv0) {
     fprintf(stderr, "usage: %s [--exefs DIR] [--romfs DIR] [--profile DIR] [--selftest | --probe-loader | "
                     "--probe-cfg | --probe-dpi | --probe-kernel | --probe-ipc | --probe-ipc-lifetime | --probe-services | --probe-fs | --probe-gfx-abi | "
                     "--probe-nvn | --probe-nvn-tex | --probe-window | --probe-shader | --probe-vkmem | "
-                    "--probe-vkexec | --probe-vkclear | --probe-vkcopy-astc | --probe-vkpool | --probe-astc | --probe-movie | --prepare-shaders | --warm-shaders | --boot |--seconds S [--shot PNG]]\n", argv0);
+                    "--probe-vkexec | --probe-vkclear | --probe-vkcopy-astc | --probe-vkpool | --probe-vkreset | --probe-astc | --probe-movie | --prepare-shaders | --warm-shaders | --boot |--seconds S [--shot PNG]]\n", argv0);
     return 2;
 }
 
@@ -545,6 +545,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "--probe-vkclear")) return probe_vkclear();
     if (!strcmp(mode, "--probe-vkcopy-astc")) return probe_vkcopy_astc();
     if (!strcmp(mode, "--probe-vkpool")) return probe_vkpool();
+    if (!strcmp(mode, "--probe-vkreset")) return probe_vkreset();
     if (!strcmp(mode, "--probe-astc")) return probe_astc();
     if (!strcmp(mode, "--probe-vkdevice")) return probe_vkdevice();
     if (!strcmp(mode, "--probe-movie")) return probe_movie();

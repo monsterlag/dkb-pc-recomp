@@ -406,8 +406,13 @@ static VkCommandBuffer prologue(VkCtx *c, uint64_t fence) {
     return cb;
 }
 
-VkCommandBuffer vk_sync_split(void) {
+static VkCommandBuffer split_impl(int wait) {
     VkCtx *c = vk_ctx();
+    VkFence prefix = VK_NULL_HANDLE;
+    if (wait) {
+        VkFenceCreateInfo fi = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        if (vkCreateFence(c->device, &fi, NULL, &prefix) != VK_SUCCESS) rt_fatal("vk: prefix fence allocation");
+    }
     VkCommandBuffer cb = slots[cur_slot].cb;
     ts_end(cb, cur_fence);
     if (!rec_end_cb(cb, 0, 0)) vkEndCommandBuffer(cb);   // every command of the part is in cb, ended by its recorder
@@ -418,11 +423,24 @@ VkCommandBuffer vk_sync_split(void) {
     VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = pro ? 2 : 1,
                         .pCommandBufferInfos = pro ? cbi : cbi + 1};
     vk_queue_lock();
-    VkResult r = vkQueueSubmit2(c->gfx_queue, 1, &si, VK_NULL_HANDLE);
+    VkResult r = vkQueueSubmit2(c->gfx_queue, 1, &si, prefix);
     vk_queue_unlock();
     if (r != VK_SUCCESS) {
         vk_device_fault_report(r);
         rt_fatal("vk: vkQueueSubmit2 of a part of value %llu failed (%d)", (unsigned long long)cur_fence, (int)r);
+    }
+    if (wait) {
+        // The full submission's timeline value is not signalled yet. Wait only for this prefix, without running its
+        // final completion callbacks or releasing the resources/command slots protected by cur_fence.
+        uint64_t t0 = perf_begin();
+        r = vkWaitForFences(c->device, 1, &prefix, VK_TRUE, UINT64_MAX);
+        perf_end(PERF_FENCE, t0);
+        perf_gpu_wait(t0);
+        if (r != VK_SUCCESS) {
+            vk_device_fault_report(r);
+            rt_fatal("vk: wait for a prefix of value %llu failed (%d)", (unsigned long long)cur_fence, (int)r);
+        }
+        vkDestroyFence(c->device, prefix, NULL);
     }
     CmdSlot *s = take_slot(c, cur_fence);   // the submitted part keeps its slot until the value is reached
     VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -433,6 +451,10 @@ VkCommandBuffer vk_sync_split(void) {
     rec_begin(s->cb);
     return s->cb;
 }
+
+VkCommandBuffer vk_sync_split(void) { return split_impl(0); }
+
+VkCommandBuffer vk_sync_split_wait(void) { return split_impl(1); }
 
 // Asynchronous replay (vk_backend.c): the value the next queued submission or present will signal. Values are handed
 // out in queue order and the replay thread submits them in that order, so each vk_sync_submit gets exactly its value.
@@ -445,7 +467,8 @@ uint64_t vk_sync_reserve(void) {
     return v;
 }
 
-uint64_t vk_sync_submit(const uint64_t *handles, int n, uint64_t submitted_ticks) {
+uint64_t vk_sync_submit_record(VkSyncRecordFn record, void *context, uint64_t submitted_ticks) {
+    if (!record) rt_fatal("vk: submission without a recorder");
     vk_sync_start();
     VkCtx *c = vk_ctx();
     plat_mutex_lock(&sub_lock);
@@ -463,7 +486,7 @@ uint64_t vk_sync_submit(const uint64_t *handles, int n, uint64_t submitted_ticks
     vk_crumb(s->cb, VK_CRUMB_SUBMIT, fence);
     ts_begin(s->cb);
     rec_begin(s->cb);
-    int recorded = vk_exec_record(s->cb, handles, n, fence, submitted_ticks);
+    int recorded = record(s->cb, fence, submitted_ticks, context);
     s = &slots[cur_slot];   // the last part (vk_sync_split)
     if (recorded) ts_end(s->cb, fence);
     else ts_drop();
@@ -498,6 +521,18 @@ uint64_t vk_sync_submit(const uint64_t *handles, int n, uint64_t submitted_ticks
     if (++subs % 4096 == 0) rec_stats_log();
     plat_mutex_unlock(&sub_lock);
     return fence;
+}
+
+typedef struct { const uint64_t *handles; int n; } ReplayHandles;
+
+static int record_handles(VkCommandBuffer cb, uint64_t fence, uint64_t submitted_ticks, void *context) {
+    const ReplayHandles *r = context;
+    return vk_exec_record(cb, r->handles, r->n, fence, submitted_ticks);
+}
+
+uint64_t vk_sync_submit(const uint64_t *handles, int n, uint64_t submitted_ticks) {
+    ReplayHandles r = {handles, n};
+    return vk_sync_submit_record(record_handles, &r, submitted_ticks);
 }
 
 void vk_completion_add(uint64_t fence, void (*fn)(void *), void *arg) {
