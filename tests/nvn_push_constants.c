@@ -41,6 +41,10 @@ static uint64_t call(void (*fn)(Cpu *), const uint64_t args[8]) {
 unsigned rt_trace;
 static uint64_t replayed;
 void nvn_called(uint8_t *seen, const char *name) { (void)seen; (void)name; }
+// This fixture tests recording, not diagnostics; the real trace has its own concurrent packet.
+void nvn_mode_trace(unsigned kind, uint64_t cb, uint64_t handle, uint32_t value, uint64_t submit) {
+    (void)kind; (void)cb; (void)handle; (void)value; (void)submit;
+}
 void plat_mutex_lock(PlatMutex *m) { (void)m; }
 void plat_mutex_unlock(PlatMutex *m) { (void)m; }
 void plat_mutex_lock_shared(PlatMutex *m) { (void)m; }

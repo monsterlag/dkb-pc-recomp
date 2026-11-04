@@ -44,6 +44,10 @@ static int checks, failures;
 #define CHECK(c, text) do { checks++; if (!(c)) { failures++; fprintf(stderr, "FAIL: %s\n", text); } } while (0)
 
 unsigned rt_trace;
+// Explicit off diagnostic provider; ordering assertions exercise the real recorder/submit path.
+void nvn_mode_trace(unsigned kind, uint64_t cb, uint64_t handle, uint32_t value, uint64_t submit) {
+    (void)kind; (void)cb; (void)handle; (void)value; (void)submit;
+}
 void rt_log(const char *fmt, ...) { (void)fmt; }
 void rt_fatal(const char *fmt, ...) {
     va_list args; va_start(args, fmt); vfprintf(stderr, fmt, args); va_end(args);

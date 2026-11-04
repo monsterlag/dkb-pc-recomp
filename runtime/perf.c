@@ -9,6 +9,7 @@
 #include "flight.h"
 #include "gfx.h"
 #include "host.h"
+#include "nvn_mode_trace.h"
 #include "perfmon.h"
 #include "prof.h"
 #include "platform/platform.h"
@@ -53,6 +54,7 @@ void prof_start(void) {
 }
 
 void prof_write(void) {
+    nvn_mode_trace_finish(); // current callers are process exit paths (boot, window close, ExitProcess)
     perf_summary_flush();
     prof_sampler_write();
 }

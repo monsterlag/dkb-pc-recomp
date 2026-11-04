@@ -21,6 +21,7 @@
 #include "host.h"
 #include "nvn_api.h"
 #include "nvn_hmap.h"
+#include "nvn_mode_trace.h"
 #include "platform/platform.h"
 
 #define CMD_MAGIC MAGIC('C', 'M', 'D', 'B')
@@ -329,6 +330,7 @@ NVN_API(nvnCommandBufferInitialize) {
     o->inline_cur = ~0ull;
     o->inline_end = 0;
     cb_set_disabled(o, CB_NO_COMMAND | CB_NO_CONTROL, 0);
+    nvn_mode_trace(NVN_MODE_INIT, (uintptr_t)o, 0, 0, 0);
     ret_x(c, 1);
 }
 // void nvnCommandBufferFinalize(NVNcommandBuffer *cmd): handles outlive their recorder
@@ -338,6 +340,7 @@ NVN_API(nvnCommandBufferFinalize) {
     o->seg = o->cur = o->end = NULL;
     o->magic = 0;
     cb_set_disabled(o, CB_NO_COMMAND | CB_NO_CONTROL, 0);
+    nvn_mode_trace(NVN_MODE_FINALIZE, (uintptr_t)o, 0, 0, 0);
 }
 // void nvnCommandBufferSetMemoryCallback(NVNcommandBuffer *cmd, PFNNVNCOMMANDBUFFERMEMORYCALLBACKPROC callback)
 NVN_API(nvnCommandBufferSetMemoryCallback) { cmd_of(c)->cb = arg_p(c, 1); }
@@ -393,6 +396,7 @@ NVN_API(nvnCommandBufferBeginRecording) {
     put_hdr(cmd_alloc(o, 8), OP_BEGIN, 8);
     o->hw_used -= 8;   // BEGIN and END have no hardware equivalent
     o->hw_start = o->hw_used;
+    nvn_mode_trace(NVN_MODE_BEGIN, (uintptr_t)o, 0, 0, 0);
     if (!o->game_size) memory_event(c, o, NVN_COMMAND_BUFFER_MEMORY_EVENT_OUT_OF_COMMAND_MEMORY, MIN_COMMAND_SIZE);
 }
 // NVNcommandHandle nvnCommandBufferEndRecording(NVNcommandBuffer *cmd)
@@ -409,6 +413,7 @@ NVN_API(nvnCommandBufferEndRecording) {
     uintptr_t hi = o->ctl ? lo + 1 : 0;
     o->ctl_used += CTL_PER_RECORDING;
     copy_add(lo, hi, copy);
+    nvn_mode_trace(NVN_MODE_END, (uintptr_t)o, (uintptr_t)copy, 0, 0);
     ret_x(c, (uintptr_t)copy);
 }
 // NVNboolean nvnCommandBufferIsRecording(const NVNcommandBuffer *cmd)
@@ -1024,7 +1029,12 @@ static int resolve_deferred(const uint8_t *p, int depth) {   // returns the numb
 
 void nvn_submit_prepare(const uint64_t *handles, int n) {
     uint64_t now = __atomic_add_fetch(&nsubmits, 1, __ATOMIC_RELAXED);
-    for (int i = 0; i < n; i++) copy_touch(handles[i], now, "QueueSubmitCommands");
+    nvn_mode_trace(NVN_MODE_PREPARE, 0, 0, (uint32_t)n, now);
+    for (int i = 0; i < n; i++) {
+        uint64_t handle = handles[i];
+        copy_touch(handle, now, "QueueSubmitCommands");
+        nvn_mode_trace(NVN_MODE_HANDLE, 0, handle, (uint32_t)i, now);
+    }
     wait_submission(handles, n);
     for (int i = 0; i < n; i++) resolve_deferred((const uint8_t *)(uintptr_t)handles[i], 0);
 }
@@ -1033,17 +1043,20 @@ void nvn_submit_prepare(const uint64_t *handles, int n) {
 // deferred binds (or is not known to hold none), this submission gets a clone, resolved here and freed after its replay.
 void nvn_submit_prepare_async(const uint64_t *handles, uint64_t *out, int n) {
     uint64_t now = __atomic_add_fetch(&nsubmits, 1, __ATOMIC_RELAXED);
+    nvn_mode_trace(NVN_MODE_PREPARE, 0, 0, (uint32_t)n, now);
     uint64_t replayed = gfx_replayed_submits();
     plat_mutex_lock(&copy_lock);
     if (nzombies) zombie_sweep(replayed);
     for (int i = 0; i < n; i++) {
-        copy_prefix *pf = copy_find(handles[i]);
+        uint64_t handle = handles[i];
+        copy_prefix *pf = copy_find(handle);
         if (!pf) {
             plat_mutex_unlock(&copy_lock);
             rt_fatal("nvn: QueueSubmitCommands: command handle %#llx is not a live recording (released or never recorded)",
-                     (unsigned long long)handles[i]);
+                     (unsigned long long)handle);
         }
-        out[i] = handles[i];
+        nvn_mode_trace(NVN_MODE_HANDLE, 0, handle, (uint32_t)i, now);
+        out[i] = handle;
         if (pf->used_at > replayed && pf->used_at != now && pf->deferred != 1) {
             size_t sz = sizeof *pf + pf->bytes;
             copy_prefix *cl = malloc(sz);

@@ -7,6 +7,7 @@
 #include "gfx.h"
 #include "host.h"
 #include "nvn_api.h"
+#include "nvn_mode_trace.h"
 #include "nvn_obj.h"
 
 // ---- Queues. The host has one queue model: a queue's primary queue and its ray-tracing memory change nothing.
@@ -69,7 +70,13 @@ NVN_API(nvnCommandBufferSetComputeOverlapMode) { (void)c; }
         (void)c;                                                                                                     \
         if (!__atomic_exchange_n(&logged, 1, __ATOMIC_RELAXED)) rt_log("nvn2: " #n " accepted, not recorded yet");   \
     }
-NVN2_NOT_RECORDED(nvnCommandBufferSetRecordingMode)
+#define NVN2_MODE_NOT_RECORDED(n, kind)                                                                               \
+    NVN_API(n) {                                                                                                    \
+        static volatile int32_t logged;                                                                             \
+        nvn_mode_trace(kind, arg_x(c, 0), 0, (uint32_t)arg_x(c, 1), 0);                                                \
+        if (!__atomic_exchange_n(&logged, 1, __ATOMIC_RELAXED)) rt_log("nvn2: " #n " accepted, not recorded yet");  \
+    }
+NVN2_MODE_NOT_RECORDED(nvnCommandBufferSetRecordingMode, NVN_MODE_RECORDING)
 NVN2_NOT_RECORDED(nvnCommandBufferBeginDeviceCommands)
 NVN2_NOT_RECORDED(nvnCommandBufferEndDeviceCommands)
 NVN2_NOT_RECORDED(nvnCommandBufferSubmitDeviceCommands)
@@ -114,5 +121,5 @@ NVN2_NOT_RECORDED(nvnCommandBufferSetComputeEnableConditional)
 NVN2_NOT_RECORDED(nvnCommandBufferSetCopyEnable)
 NVN2_NOT_RECORDED(nvnCommandBufferSetCopyEnableConditional)
 NVN2_NOT_RECORDED(nvnCommandBufferSetConservativeRasterMode)
-NVN2_NOT_RECORDED(nvnCommandBufferSetGeometryProcessingMode)
+NVN2_MODE_NOT_RECORDED(nvnCommandBufferSetGeometryProcessingMode, NVN_MODE_GEOMETRY)
 NVN2_NOT_RECORDED(nvnCommandBufferSetRepresentativeFragmentTest)
